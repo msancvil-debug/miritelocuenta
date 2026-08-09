@@ -88,16 +88,16 @@ def generar_articulo_miri(tema_viral):
         }
     }
     
-    # Sistema de reintentos automáticos si da límite de velocidad (Error 429)
-    max_intentos = 3
+    # Sistema de espera ampliado a 65 segundos si da cuota temporal
+    max_intentos = 4
     for intento in range(1, max_intentos + 1):
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response = requests.post(url, headers=headers, json=payload, timeout=40)
         
         if response.status_code == 200:
             break
         elif response.status_code == 429 and intento < max_intentos:
-            print(f"⚠️ Límite de cuota momentáneo (429). Esperando 35 segundos para reintentar (Intento {intento}/{max_intentos})...")
-            time.sleep(35)
+            print(f"⚠️ Límite de cuota momentáneo (429). Esperando 65 segundos para reintentar (Intento {intento}/{max_intentos})...")
+            time.sleep(65)
         else:
             raise Exception(f"Error Gemini API ({response.status_code}): {response.text}")
         
