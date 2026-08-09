@@ -2,6 +2,7 @@ import requests
 import json
 import os
 import smtplib
+import time
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import xml.etree.ElementTree as ET
@@ -55,7 +56,6 @@ def obtener_nuevo_tema_viral():
     return None
 
 def generar_articulo_miri(tema_viral):
-    # MODELO OFICIAL ACTUALIZADO
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
     
     prompt = f"""
@@ -88,9 +88,18 @@ def generar_articulo_miri(tema_viral):
         }
     }
     
-    response = requests.post(url, headers=headers, json=payload, timeout=30)
-    if response.status_code != 200:
-        raise Exception(f"Error Gemini API ({response.status_code}): {response.text}")
+    # Sistema de reintentos automáticos si da límite de velocidad (Error 429)
+    max_intentos = 3
+    for intento in range(1, max_intentos + 1):
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        
+        if response.status_code == 200:
+            break
+        elif response.status_code == 429 and intento < max_intentos:
+            print(f"⚠️ Límite de cuota momentáneo (429). Esperando 35 segundos para reintentar (Intento {intento}/{max_intentos})...")
+            time.sleep(35)
+        else:
+            raise Exception(f"Error Gemini API ({response.status_code}): {response.text}")
         
     res_data = response.json()
     raw_text = res_data['candidates'][0]['content']['parts'][0]['text'].strip()
