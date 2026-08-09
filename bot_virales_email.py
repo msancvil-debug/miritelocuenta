@@ -22,6 +22,13 @@ HEADERS_BROWSER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
+# Lista de modelos de reserva por si uno agota la cuota diaria gratuita
+MODELOS_RESERVA = [
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash"
+]
+
 def cargar_historial():
     if os.path.exists(HISTORIAL_FILE):
         try:
@@ -56,8 +63,6 @@ def obtener_nuevo_tema_viral():
     return None
 
 def generar_articulo_miri(tema_viral):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-    
     prompt = f"""
     Eres la redactora principal del proyecto "Miri te lo cuenta", un portal sobre tendencias de internet, vídeos virales, reality shows y cultura pop en redes sociales (TikTok, X, Instagram, YouTube).
 
@@ -87,30 +92,41 @@ def generar_articulo_miri(tema_viral):
             "response_mime_type": "application/json"
         }
     }
-    
-    max_intentos = 4
-    for intento in range(1, max_intentos + 1):
-        response = requests.post(url, headers=headers, json=payload, timeout=40)
-        
-        if response.status_code == 200:
-            break
-        elif response.status_code == 429 and intento < max_intentos:
-            print(f"⚠️ Límite de cuota momentáneo (429). Esperando 65 segundos para reintentar (Intento {intento}/{max_intentos})...")
-            time.sleep(65)
-        else:
-            raise Exception(f"Error Gemini API ({response.status_code}): {response.text}")
-        
-    res_data = response.json()
-    raw_text = res_data['candidates'][0]['content']['parts'][0]['text'].strip()
-    
-    if raw_text.startswith("```"):
-        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+
+    ultimo_error = ""
+
+    # Probamos los modelos uno por uno si el anterior falla o no tiene cuota
+    for modelo in MODELOS_RESERVA:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={GEMINI_API_KEY}"
+        print(f"🤖 Intentando redactar con el modelo: {modelo}...")
+
+        max_intentos = 2
+        for intento in range(1, max_intentos + 1):
+            response = requests.post(url, headers=headers, json=payload, timeout=40)
             
-    try:
-        articulo = json.loads(raw_text)
-        return articulo["titulo"], articulo["contenido_html"]
-    except json.JSONDecodeError as e:
-        raise Exception(f"Error al parsear la respuesta JSON de Gemini: {e}\nTexto recibido:\n{raw_text}")
+            if response.status_code == 200:
+                res_data = response.json()
+                raw_text = res_data['candidates'][0]['content']['parts'][0]['text'].strip()
+                
+                if raw_text.startswith("```"):
+                    raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+                        
+                try:
+                    articulo = json.loads(raw_text)
+                    return articulo["titulo"], articulo["contenido_html"]
+                except json.JSONDecodeError as e:
+                    raise Exception(f"Error al parsear la respuesta JSON de Gemini: {e}\nTexto recibido:\n{raw_text}")
+            
+            elif response.status_code == 429:
+                print(f"⚠️ Límite de cuota en {modelo} (429). Probando reintento corto...")
+                time.sleep(15)
+                ultimo_error = response.text
+            else:
+                print(f"⚠️ El modelo {modelo} devolvió error {response.status_code}. Pasando al modelo de reserva...")
+                ultimo_error = response.text
+                break
+
+    raise Exception(f"No se pudo generar el artículo con ningún modelo. Última respuesta de Google: {ultimo_error}")
 
 def enviar_por_email_a_wordpress(titulo, contenido_html):
     if not GMAIL_USER or not GMAIL_APP_PASS or not WP_SECRET_EMAIL:
