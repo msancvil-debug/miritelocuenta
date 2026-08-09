@@ -1,0 +1,114 @@
+import requests
+import json
+import os
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import xml.etree.ElementTree as ET
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GMAIL_USER = os.environ.get("GMAIL_USER")
+GMAIL_APP_PASS = os.environ.get("GMAIL_APP_PASS")
+WP_SECRET_EMAIL = os.environ.get("WP_SECRET_EMAIL")
+
+HISTORIAL_FILE = "historial_temas.json"
+FEEDS_TENDENCIAS = [
+    "https://trends.google.com/trending/rss?geo=ES",
+    "https://news.google.com/rss/search?q=viral+OR+telecinco+OR+tiktok+OR+reality&hl=es&gl=ES&ceid=ES:es"
+]
+
+def cargar_historial():
+    if os.path.exists(HISTORIAL_FILE):
+        with open(HISTORIAL_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+def guardar_en_historial(tema):
+    historial = cargar_historial()
+    historial.append(tema)
+    with open(HISTORIAL_FILE, "w", encoding="utf-8") as f:
+        json.dump(historial, f, ensure_ascii=False, indent=2)
+
+def obtener_nuevo_tema_viral():
+    historial = cargar_historial()
+    for feed_url in FEEDS_TENDENCIAS:
+        try:
+            res = requests.get(feed_url, timeout=10)
+            if res.status_code == 200:
+                root = ET.fromstring(res.content)
+                for item in root.findall(".//item"):
+                    title = item.find("title").text
+                    if title and title not in historial:
+                        return title
+        except Exception as e:
+            print(f"Error en feed: {e}")
+    return None
+
+def generar_articulo_miri(tema_viral):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    
+    prompt = f"""
+    Eres la redactora principal del proyecto "Miri te lo cuenta", un portal sobre tendencias de internet, vídeos virales, reality shows y cultura pop en redes sociales (TikTok, X, Instagram, YouTube).
+
+    Escribe un artículo ameno, explicativo, cotilla y optimizado para SEO sobre el siguiente tema viral:
+    "{tema_viral}"
+
+    REQUISITOS DEL ARTÍCULO:
+    1. Tono: Fresco, cercano, directo y explicativo ("Te lo cuento detalladamente").
+    2. Estructura SEO obligatoria:
+       - Título pegadizo e irresistible para Google / Google Discover.
+       - Introducción enganchante.
+       - Secciones con etiquetas HTML <h2> y <h3> (¿Qué ha pasado?, ¿Por qué se ha hecho viral?, Reacciones en redes sociales).
+       - Una sección final con 2 preguntas frecuentes (FAQ) usando HTML para posicionar en Google.
+    3. Responde ÚNICAMENTE con un objeto JSON válido (sin marcas markdown ni código extra).
+    
+    Formato JSON esperado:
+    {{
+      "titulo": "Título SEO aquí",
+      "contenido_html": "<p>Texto de introducción...</p><h2>¿Qué ha pasado?</h2><p>Contenido...</p>"
+    }}
+    """
+    
+    headers = {"Content-Type": "application/json"}
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    
+    response = requests.post(url, headers=headers, json=payload)
+    if response.status_code != 200:
+        raise Exception(f"Error Gemini: {response.status_code} - {response.text}")
+        
+    res_data = response.json()
+    raw_text = res_data['candidates'][0]['content']['parts'][0]['text'].strip()
+    
+    if raw_text.startswith("```"):
+        raw_text = raw_text.split("\n", 1)[1]
+        if raw_text.endswith("```"):
+            raw_text = raw_text.rsplit("\n", 1)[0]
+            
+    articulo = json.loads(raw_text)
+    return articulo["titulo"], articulo["contenido_html"]
+
+def enviar_por_email_a_wordpress(titulo, contenido_html):
+    msg = MIMEMultipart()
+    msg['From'] = GMAIL_USER
+    msg['To'] = WP_SECRET_EMAIL
+    msg['Subject'] = titulo
+    msg.attach(MIMEText(contenido_html, 'html'))
+
+    try:
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(GMAIL_USER, GMAIL_APP_PASS)
+        server.send_message(msg)
+        server.quit()
+        print("✅ Artículo enviado con éxito a WordPress vía Email")
+        return True
+    except Exception as e:
+        print(f"❌ Error enviando email: {e}")
+        return False
+
+if __name__ == "__main__":
+    tema = obtener_nuevo_tema_viral()
+    if tema:
+        titulo, contenido_html = generar_articulo_miri(tema)
+        if enviar_por_email_a_wordpress(titulo, contenido_html):
+            guardar_en_historial(tema)
