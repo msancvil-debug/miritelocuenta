@@ -17,15 +17,23 @@ FEEDS_TENDENCIAS = [
     "https://news.google.com/rss/search?q=viral+OR+telecinco+OR+tiktok+OR+reality&hl=es&gl=ES&ceid=ES:es"
 ]
 
+HEADERS_BROWSER = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
 def cargar_historial():
     if os.path.exists(HISTORIAL_FILE):
-        with open(HISTORIAL_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(HISTORIAL_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
     return []
 
 def guardar_en_historial(tema):
     historial = cargar_historial()
-    historial.append(tema)
+    if tema not in historial:
+        historial.append(tema)
     with open(HISTORIAL_FILE, "w", encoding="utf-8") as f:
         json.dump(historial, f, ensure_ascii=False, indent=2)
 
@@ -33,19 +41,20 @@ def obtener_nuevo_tema_viral():
     historial = cargar_historial()
     for feed_url in FEEDS_TENDENCIAS:
         try:
-            res = requests.get(feed_url, timeout=10)
+            res = requests.get(feed_url, headers=HEADERS_BROWSER, timeout=15)
             if res.status_code == 200:
                 root = ET.fromstring(res.content)
                 for item in root.findall(".//item"):
-                    title = item.find("title").text
-                    if title and title not in historial:
-                        return title
+                    title_elem = item.find("title")
+                    if title_elem is not None and title_elem.text:
+                        title = title_elem.text.strip()
+                        if title and title not in historial:
+                            return title
         except Exception as e:
-            print(f"Error en feed: {e}")
+            print(f"⚠️ Error procesando feed {feed_url}: {e}")
     return None
 
 def generar_articulo_miri(tema_viral):
-    # MODELO CORREGIDO A gemini-1.5-flash
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
     
     prompt = f"""
@@ -71,24 +80,34 @@ def generar_articulo_miri(tema_viral):
     """
     
     headers = {"Content-Type": "application/json"}
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "response_mime_type": "application/json"
+        }
+    }
     
-    response = requests.post(url, headers=headers, json=payload)
+    response = requests.post(url, headers=headers, json=payload, timeout=30)
     if response.status_code != 200:
-        raise Exception(f"Error Gemini: {response.status_code} - {response.text}")
+        raise Exception(f"Error Gemini API ({response.status_code}): {response.text}")
         
     res_data = response.json()
     raw_text = res_data['candidates'][0]['content']['parts'][0]['text'].strip()
     
     if raw_text.startswith("```"):
-        raw_text = raw_text.split("\n", 1)[1]
-        if raw_text.endswith("```"):
-            raw_text = raw_text.rsplit("\n", 1)[0]
+        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
             
-    articulo = json.loads(raw_text)
-    return articulo["titulo"], articulo["contenido_html"]
+    try:
+        articulo = json.loads(raw_text)
+        return articulo["titulo"], articulo["contenido_html"]
+    except json.JSONDecodeError as e:
+        raise Exception(f"Error al parsear la respuesta JSON de Gemini: {e}\nTexto recibido:\n{raw_text}")
 
 def enviar_por_email_a_wordpress(titulo, contenido_html):
+    if not GMAIL_USER or not GMAIL_APP_PASS or not WP_SECRET_EMAIL:
+        print("❌ Error: Faltan variables de entorno para el envío de correo (GMAIL_USER, GMAIL_APP_PASS o WP_SECRET_EMAIL).")
+        return False
+
     msg = MIMEMultipart()
     msg['From'] = GMAIL_USER
     msg['To'] = WP_SECRET_EMAIL
@@ -104,12 +123,15 @@ def enviar_por_email_a_wordpress(titulo, contenido_html):
         print("✅ Artículo enviado con éxito a WordPress vía Email")
         return True
     except Exception as e:
-        print(f"❌ Error enviando email: {e}")
+        print(f"❌ Error enviando email a WordPress: {e}")
         return False
 
 if __name__ == "__main__":
     tema = obtener_nuevo_tema_viral()
     if tema:
+        print(f"🔥 Tema viral detectado: {tema}")
         titulo, contenido_html = generar_articulo_miri(tema)
         if enviar_por_email_a_wordpress(titulo, contenido_html):
             guardar_en_historial(tema)
+    else:
+        print("ℹ️ No se encontraron nuevos temas virales sin procesar en este ciclo.")
