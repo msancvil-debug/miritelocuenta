@@ -88,7 +88,6 @@ def generar_articulo_miri(tema_viral):
         }
     }
     
-    # Sistema de espera ampliado a 65 segundos si da cuota temporal
     max_intentos = 4
     for intento in range(1, max_intentos + 1):
         response = requests.post(url, headers=headers, json=payload, timeout=40)
