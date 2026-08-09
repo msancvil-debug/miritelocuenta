@@ -22,11 +22,11 @@ HEADERS_BROWSER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-# Lista de modelos de reserva por si uno agota la cuota diaria gratuita
+# Modelos oficiales válidos y activos en la API de Gemini
 MODELOS_RESERVA = [
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
-    "gemini-1.5-flash"
+    "gemini-2.0-flash-exp"
 ]
 
 def cargar_historial():
@@ -95,12 +95,11 @@ def generar_articulo_miri(tema_viral):
 
     ultimo_error = ""
 
-    # Probamos los modelos uno por uno si el anterior falla o no tiene cuota
     for modelo in MODELOS_RESERVA:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={GEMINI_API_KEY}"
         print(f"🤖 Intentando redactar con el modelo: {modelo}...")
 
-        max_intentos = 2
+        max_intentos = 3
         for intento in range(1, max_intentos + 1):
             response = requests.post(url, headers=headers, json=payload, timeout=40)
             
@@ -118,11 +117,11 @@ def generar_articulo_miri(tema_viral):
                     raise Exception(f"Error al parsear la respuesta JSON de Gemini: {e}\nTexto recibido:\n{raw_text}")
             
             elif response.status_code == 429:
-                print(f"⚠️ Límite de cuota en {modelo} (429). Probando reintento corto...")
-                time.sleep(15)
+                print(f"⚠️ Límite de cuota en {modelo} (429). Esperando 60 segundos antes de reintentar (Intento {intento}/{max_intentos})...")
+                time.sleep(60)
                 ultimo_error = response.text
             else:
-                print(f"⚠️ El modelo {modelo} devolvió error {response.status_code}. Pasando al modelo de reserva...")
+                print(f"⚠️ El modelo {modelo} devolvió error {response.status_code}. Pasando al siguiente modelo de reserva...")
                 ultimo_error = response.text
                 break
 
