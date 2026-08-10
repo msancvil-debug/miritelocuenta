@@ -22,7 +22,6 @@ HEADERS_BROWSER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-# Modelos oficiales válidos y activos en la API de Gemini
 MODELOS_RESERVA = [
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
@@ -69,19 +68,21 @@ def generar_articulo_miri(tema_viral):
     Escribe un artículo ameno, explicativo, cotilla y optimizado para SEO sobre el siguiente tema viral:
     "{tema_viral}"
 
-    REQUISITOS DEL ARTÍCULO:
+    REQUISITOS DEL ARTÍCULO Y ESTÉTICA NEO-BRUTALISTA (INLINE STYLES):
     1. Tono: Fresco, cercano, directo y explicativo ("Te lo cuento detalladamente").
-    2. Estructura SEO obligatoria:
-       - Título pegadizo e irresistible para Google / Google Discover.
-       - Introducción enganchante.
-       - Secciones con etiquetas HTML <h2> y <h3> (¿Qué ha pasado?, ¿Por qué se ha hecho viral?, Reacciones en redes sociales).
-       - Una sección final con 2 preguntas frecuentes (FAQ) usando HTML para posicionar en Google.
+    2. Todo el HTML DEBE llevar estilos en línea (inline styles) para mantener la estética Neo-brutalista de la web:
+       - Paleta de colores: Fondo Marfil (#FFF7EF), Bordes Negros (#161616), Amarillo (#FFD84D), Coral (#F04438).
+       - Cajas destacadas (Resumen o Claves): <div style="background-color: #FFD84D; border: 3px solid #161616; border-radius: 12px; padding: 16px; margin: 20px 0; box-shadow: 4px 4px 0px #161616;">
+       - Títulos h2: <h2 style="font-size: 22px; font-weight: 800; color: #161616; background-color: #FFF7EF; border-left: 6px solid #F04438; padding: 8px 12px; margin-top: 25px;">
+       - Títulos h3: <h3 style="font-size: 18px; font-weight: 700; color: #161616; margin-top: 20px;">
+       - Texto normal en párrafos: <p style="font-size: 16px; line-height: 1.6; color: #161616; margin-bottom: 15px;">
+       - Sección FAQ al final en una caja Neo-brutalista: <div style="background-color: #FFF7EF; border: 3px solid #161616; border-radius: 12px; padding: 18px; margin-top: 30px; box-shadow: 4px 4px 0px #161616;">
     3. Responde ÚNICAMENTE con un objeto JSON válido (sin marcas markdown ni código extra).
     
     Formato JSON esperado:
     {{
       "titulo": "Título SEO aquí",
-      "contenido_html": "<p>Texto de introducción...</p><h2>¿Qué ha pasado?</h2><p>Contenido...</p>"
+      "contenido_html": "<p style='...'>Texto de introducción...</p><div style='...'>Resumen...</div>"
     }}
     """
     
@@ -93,43 +94,39 @@ def generar_articulo_miri(tema_viral):
         }
     }
 
-    ultimo_error = ""
-
     for modelo in MODELOS_RESERVA:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={GEMINI_API_KEY}"
         print(f"🤖 Intentando redactar con el modelo: {modelo}...")
 
-        max_intentos = 3
-        for intento in range(1, max_intentos + 1):
-            response = requests.post(url, headers=headers, json=payload, timeout=40)
-            
-            if response.status_code == 200:
-                res_data = response.json()
-                raw_text = res_data['candidates'][0]['content']['parts'][0]['text'].strip()
+        for intento in range(1, 3):
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=40)
                 
-                if raw_text.startswith("```"):
-                    raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-                        
-                try:
+                if response.status_code == 200:
+                    res_data = response.json()
+                    raw_text = res_data['candidates'][0]['content']['parts'][0]['text'].strip()
+                    
+                    if raw_text.startswith("```"):
+                        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+                            
                     articulo = json.loads(raw_text)
                     return articulo["titulo"], articulo["contenido_html"]
-                except json.JSONDecodeError as e:
-                    raise Exception(f"Error al parsear la respuesta JSON de Gemini: {e}\nTexto recibido:\n{raw_text}")
-            
-            elif response.status_code == 429:
-                print(f"⚠️ Límite de cuota en {modelo} (429). Esperando 60 segundos antes de reintentar (Intento {intento}/{max_intentos})...")
-                time.sleep(60)
-                ultimo_error = response.text
-            else:
-                print(f"⚠️ El modelo {modelo} devolvió error {response.status_code}. Pasando al siguiente modelo de reserva...")
-                ultimo_error = response.text
+                
+                elif response.status_code == 429:
+                    print(f"⚠️ Límite de cuota en {modelo} (429). Esperando 20s...")
+                    time.sleep(20)
+                else:
+                    break
+            except Exception as e:
+                print(f"⚠️ Excepción en solicitud: {e}")
                 break
 
-    raise Exception(f"No se pudo generar el artículo con ningún modelo. Última respuesta de Google: {ultimo_error}")
+    print("ℹ️ La API de Google está temporalmente saturada o sin cuota. Se reintentará en el próximo ciclo automático sin enviar alerta.")
+    return None, None
 
 def enviar_por_email_a_wordpress(titulo, contenido_html):
     if not GMAIL_USER or not GMAIL_APP_PASS or not WP_SECRET_EMAIL:
-        print("❌ Error: Faltan variables de entorno para el envío de correo (GMAIL_USER, GMAIL_APP_PASS o WP_SECRET_EMAIL).")
+        print("❌ Faltan variables de entorno para el envío.")
         return False
 
     msg = MIMEMultipart()
@@ -147,7 +144,7 @@ def enviar_por_email_a_wordpress(titulo, contenido_html):
         print("✅ Artículo enviado con éxito a WordPress vía Email")
         return True
     except Exception as e:
-        print(f"❌ Error enviando email a WordPress: {e}")
+        print(f"❌ Error enviando email: {e}")
         return False
 
 if __name__ == "__main__":
@@ -155,7 +152,8 @@ if __name__ == "__main__":
     if tema:
         print(f"🔥 Tema viral detectado: {tema}")
         titulo, contenido_html = generar_articulo_miri(tema)
-        if enviar_por_email_a_wordpress(titulo, contenido_html):
-            guardar_en_historial(tema)
+        if titulo and contenido_html:
+            if enviar_por_email_a_wordpress(titulo, contenido_html):
+                guardar_en_historial(tema)
     else:
-        print("ℹ️ No se encontraron nuevos temas virales sin procesar en este ciclo.")
+        print("ℹ️ No se encontraron nuevos temas virales en este ciclo.")
