@@ -13,9 +13,11 @@ GMAIL_APP_PASS = os.environ.get("GMAIL_APP_PASS")
 WP_SECRET_EMAIL = os.environ.get("WP_SECRET_EMAIL")
 
 HISTORIAL_FILE = "historial_temas.json"
+
+# Fuentes RSS estables que no bloquean servidores cloud
 FEEDS_TENDENCIAS = [
-    "https://trends.google.com/trending/rss?geo=ES",
-    "https://news.google.com/rss/search?q=viral+OR+telecinco+OR+tiktok+OR+reality&hl=es&gl=ES&ceid=ES:es"
+    "https://news.google.com/rss/search?q=viral+OR+tiktok+OR+telecinco+OR+reality&hl=es&gl=ES&ceid=ES:es",
+    "https://20minutos.es/rss/"
 ]
 
 HEADERS_BROWSER = {
@@ -48,6 +50,7 @@ def obtener_nuevo_tema_viral():
     historial = cargar_historial()
     for feed_url in FEEDS_TENDENCIAS:
         try:
+            print(f"📡 Leyendo noticias de: {feed_url}...")
             res = requests.get(feed_url, headers=HEADERS_BROWSER, timeout=15)
             if res.status_code == 200:
                 root = ET.fromstring(res.content)
@@ -57,6 +60,8 @@ def obtener_nuevo_tema_viral():
                         title = title_elem.text.strip()
                         if title and title not in historial:
                             return title
+            else:
+                print(f"⚠️ El feed respondió con código: {res.status_code}")
         except Exception as e:
             print(f"⚠️ Error procesando feed {feed_url}: {e}")
     return None
@@ -121,7 +126,7 @@ def generar_articulo_miri(tema_viral):
                 print(f"⚠️ Excepción en solicitud: {e}")
                 break
 
-    print("ℹ️ La API de Google está temporalmente saturada o sin cuota. Se reintentará en el próximo ciclo automático sin enviar alerta.")
+    print("ℹ️ La API de Google está temporalmente saturada o sin cuota.")
     return None, None
 
 def enviar_por_email_a_wordpress(titulo, contenido_html):
@@ -149,11 +154,14 @@ def enviar_por_email_a_wordpress(titulo, contenido_html):
 
 if __name__ == "__main__":
     tema = obtener_nuevo_tema_viral()
-    if tema:
-        print(f"🔥 Tema viral detectado: {tema}")
-        titulo, contenido_html = generar_articulo_miri(tema)
-        if titulo and contenido_html:
-            if enviar_por_email_a_wordpress(titulo, contenido_html):
-                guardar_en_historial(tema)
-    else:
-        print("ℹ️ No se encontraron nuevos temas virales en este ciclo.")
+    
+    # Si no encuentra ninguna noticia en los RSS, fuerza una de tendencia actual
+    if not tema:
+        print("⚠️ No se pudieron leer los RSS o se agotaron. Usando tema de tendencia automática...")
+        tema = "Polémica y tendencias virales en TikTok de esta semana"
+
+    print(f"🔥 Tema viral detectado: {tema}")
+    titulo, contenido_html = generar_articulo_miri(tema)
+    if titulo and contenido_html:
+        if enviar_por_email_a_wordpress(titulo, contenido_html):
+            guardar_en_historial(tema)
