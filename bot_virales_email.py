@@ -10,6 +10,7 @@ from io import BytesIO
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.image import MIMEImage
 
 # 1. VARIABLES DE ENTORNO
 GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
@@ -17,7 +18,7 @@ WP_URL = (os.environ.get("WP_URL") or "").strip().rstrip("/")
 WP_USER = (os.environ.get("WP_USER") or "").strip()
 WP_APP_PASS = (os.environ.get("WP_APP_PASS") or "").strip().replace(" ", "")
 
-# Fallback por Email
+# Credenciales de Email (Publicación vía Correo Secreto de WordPress)
 GMAIL_USER = (os.environ.get("GMAIL_USER") or "").strip()
 GMAIL_APP_PASS = (os.environ.get("GMAIL_APP_PASS") or "").strip()
 WP_SECRET_EMAIL = (os.environ.get("WP_SECRET_EMAIL") or "").strip()
@@ -87,7 +88,7 @@ def obtener_modelos_disponibles():
     return ["gemini-1.5-flash", "gemini-1.5-pro"]
 
 def extraer_keywords_foto(tema_viral, modelos):
-    """Pide a Gemini 2-3 palabras clave en inglés sobre el personaje o temática concreta."""
+    """Pide a Gemini 2-3 palabras clave en inglés sobre la temática."""
     prompt = f"""
     Analiza esta noticia: "{tema_viral}"
     Extrae de 2 a 3 palabras clave en inglés separadas por comas que describan al personaje o tema principal para buscar una fotografía temática de fondo.
@@ -95,7 +96,6 @@ def extraer_keywords_foto(tema_viral, modelos):
     - Si habla de un presentador o famosos en TV -> "television, presenter, celebrity"
     - Si habla de cantantes o conciertos -> "singer, concert, stage"
     - Si habla de facturas o dinero -> "money, bill, finance"
-    - Si habla de un reality show -> "reality show, studio"
 
     Responde ÚNICAMENTE con las palabras clave en inglés.
     """
@@ -120,7 +120,7 @@ def generar_articulo_miri(tema_viral):
     
     prompt = f"""
     Eres la redactora principal del portal "Miri te lo cuenta".
-    Escribe un artículo ameno, cotilla, fresco y impecable sobre la siguiente tendencia:
+    Escribe un artículo ameno, cotilla, fresco y bien redactado sobre la siguiente tendencia:
     "{tema_viral}"
 
     REQUISITOS DEL TÍTULO:
@@ -218,64 +218,79 @@ def crear_imagen_destacada(titulo, keywords_foto):
 
     img_filename = "miniatura_destacada.jpg"
     img.convert("RGB").save(img_filename, "JPEG", quality=92)
-    print("✅ Miniatura temática generada con éxito.")
+    print("✅ Miniatura temática generada con éxito en disco.")
     return img_filename
 
 def publicar_en_wordpress(titulo, contenido_html, ruta_imagen):
+    # Opción 1: API REST (si están configuradas las credenciales)
     if WP_URL and WP_USER and WP_APP_PASS:
-        print("🚀 Publicando vía API REST de WordPress...")
-        url_media = f"{WP_URL}/wp-json/wp/v2/media"
-        with open(ruta_imagen, "rb") as f:
-            media_bytes = f.read()
-        
-        headers_media = {
-            "Content-Disposition": f"attachment; filename={os.path.basename(ruta_imagen)}",
-            "Content-Type": "image/jpeg"
-        }
-        r_media = requests.post(url_media, data=media_bytes, headers=headers_media, auth=(WP_USER, WP_APP_PASS), timeout=30)
-        
-        media_id = None
-        url_foto = ""
-        if r_media.status_code in [200, 201]:
-            media_json = r_media.json()
-            media_id = media_json.get("id")
-            url_foto = media_json.get("source_url", "")
+        try:
+            print("🚀 Intentando publicar vía API REST de WordPress...")
+            url_media = f"{WP_URL}/wp-json/wp/v2/media"
+            with open(ruta_imagen, "rb") as f:
+                media_bytes = f.read()
+            
+            headers_media = {
+                "Content-Disposition": f"attachment; filename={os.path.basename(ruta_imagen)}",
+                "Content-Type": "image/jpeg"
+            }
+            r_media = requests.post(url_media, data=media_bytes, headers=headers_media, auth=(WP_USER, WP_APP_PASS), timeout=30)
+            
+            media_id = None
+            url_foto = ""
+            if r_media.status_code in [200, 201]:
+                media_json = r_media.json()
+                media_id = media_json.get("id")
+                url_foto = media_json.get("source_url", "")
 
-        # Insertar imagen en la cabecera HTML del post para lectura automática de Metricool
-        html_final = f"""
-        <div style="margin-bottom: 20px; text-align: center;">
-            <img src="{url_foto}" alt="{titulo}" style="max-width: 100%; height: auto; border-radius: 8px; border: 2px solid #161616;" />
-        </div>
-        {contenido_html}
-        """
+            html_final = f"""
+            <div style="margin-bottom: 20px; text-align: center;">
+                <img src="{url_foto}" alt="{titulo}" style="max-width: 100%; height: auto; border-radius: 8px; border: 2px solid #161616;" />
+            </div>
+            {contenido_html}
+            """
 
-        url_posts = f"{WP_URL}/wp-json/wp/v2/posts"
-        payload = {"title": titulo, "content": html_final, "status": "publish"}
-        if media_id:
-            payload["featured_media"] = media_id
+            url_posts = f"{WP_URL}/wp-json/wp/v2/posts"
+            payload = {"title": titulo, "content": html_final, "status": "publish"}
+            if media_id:
+                payload["featured_media"] = media_id
 
-        r_post = requests.post(url_posts, json=payload, headers={"Content-Type": "application/json"}, auth=(WP_USER, WP_APP_PASS), timeout=30)
-        if r_post.status_code in [200, 201]:
-            print("🎉 ¡Publicado con éxito en WordPress vía API REST!")
-            return True
+            r_post = requests.post(url_posts, json=payload, headers={"Content-Type": "application/json"}, auth=(WP_USER, WP_APP_PASS), timeout=30)
+            if r_post.status_code in [200, 201]:
+                print("🎉 ¡Publicado con éxito en WordPress vía API REST!")
+                return True
+        except Exception as e:
+            print(f"⚠️ Falló la publicación por API REST: {e}. Probando vía correo secreto...")
 
+    # Opción 2: Correo Secreto (Jetpack / WordPress Post-by-Email)
     if GMAIL_USER and GMAIL_APP_PASS and WP_SECRET_EMAIL:
-        print("📧 Publicando vía correo electrónico...")
+        print("📧 Publicando vía correo electrónico en WordPress...")
         msg = MIMEMultipart()
         msg['From'] = GMAIL_USER
         msg['To'] = WP_SECRET_EMAIL
         msg['Subject'] = titulo
+
+        # Adjuntar cuerpo HTML
         msg.attach(MIMEText(contenido_html, 'html'))
+
+        # ADJUNTAR LA IMAGEN GENERADA AL CORREO DE NATIVO DE WORDPRESS
+        if ruta_imagen and os.path.exists(ruta_imagen):
+            with open(ruta_imagen, 'rb') as f:
+                img_data = f.read()
+                image_mime = MIMEImage(img_data, name=os.path.basename(ruta_imagen))
+                image_mime.add_header('Content-Disposition', 'attachment', filename=os.path.basename(ruta_imagen))
+                msg.attach(image_mime)
+                print("📎 Imagen de miniatura adjuntada con éxito al correo.")
 
         server = smtplib.SMTP('smtp.gmail.com', 587)
         server.starttls()
         server.login(GMAIL_USER, GMAIL_APP_PASS)
         server.send_message(msg)
         server.quit()
-        print("🎉 ¡Correo enviado a WordPress!")
+        print("🎉 ¡Correo enviado con éxito a WordPress con la imagen adjunta!")
         return True
 
-    raise Exception("Faltan credenciales de WordPress.")
+    raise Exception("Faltan credenciales de publicación de WordPress (API REST o Email).")
 
 if __name__ == "__main__":
     tema = obtener_nuevo_tema_viral()
