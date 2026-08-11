@@ -7,20 +7,20 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import xml.etree.ElementTree as ET
 
-# 1. Comprobación estricta de variables de entorno
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GMAIL_USER = os.environ.get("GMAIL_USER")
-GMAIL_APP_PASS = os.environ.get("GMAIL_APP_PASS")
-WP_SECRET_EMAIL = os.environ.get("WP_SECRET_EMAIL")
+# Limpieza estricta de variables de entorno (elimina espacios y saltos de línea invisibles)
+GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
+GMAIL_USER = (os.environ.get("GMAIL_USER") or "").strip()
+GMAIL_APP_PASS = (os.environ.get("GMAIL_APP_PASS") or "").strip().replace(" ", "")
+WP_SECRET_EMAIL = (os.environ.get("WP_SECRET_EMAIL") or "").strip()
 
 print("--- DIAGNÓSTICO DE VARIABLES DE ENTORNO ---")
-print(f"GEMINI_API_KEY: {'Detectada' if GEMINI_API_KEY else '❌ FALTA EN GITHUB SECRETS'}")
+print(f"GEMINI_API_KEY: {'Detectada (longitud: ' + str(len(GEMINI_API_KEY)) + ')' if GEMINI_API_KEY else '❌ FALTA EN GITHUB SECRETS'}")
 print(f"GMAIL_USER: {GMAIL_USER if GMAIL_USER else '❌ FALTA EN GITHUB SECRETS'}")
 print(f"GMAIL_APP_PASS: {'Detectada' if GMAIL_APP_PASS else '❌ FALTA EN GITHUB SECRETS'}")
 print(f"WP_SECRET_EMAIL: {WP_SECRET_EMAIL if WP_SECRET_EMAIL else '❌ FALTA EN GITHUB SECRETS'}")
 
 if not all([GEMINI_API_KEY, GMAIL_USER, GMAIL_APP_PASS, WP_SECRET_EMAIL]):
-    raise Exception("ERROR CRÍTICO: Falta una o varias variables en GitHub Secrets. Revisa los nombres exactos.")
+    raise Exception("ERROR CRÍTICO: Falta una o varias variables en GitHub Secrets.")
 
 HISTORIAL_FILE = "historial_temas.json"
 FEEDS_TENDENCIAS = [
@@ -32,18 +32,11 @@ HEADERS_BROWSER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-# Amplia lista de modelos activos para probar automáticamente en orden
 MODELOS_RESERVA = [
     "gemini-2.5-flash",
-    "gemini-1.5-flash",
     "gemini-2.0-flash",
-    "gemini-1.5-pro",
-    "gemini-2.5-pro",
-    "gemini-1.5-flash-8b",
-    "gemini-1.5-flash-latest"
+    "gemini-1.5-flash"
 ]
-
-API_VERSIONS = ["v1beta", "v1"]
 
 def cargar_historial():
     if os.path.exists(HISTORIAL_FILE):
@@ -103,45 +96,64 @@ def generar_articulo_miri(tema_viral):
       "contenido_html": "<p style='...'>Texto de introducción...</p><div style='...'>Resumen...</div>"
     }}
     """
-    
+
+    # 1. Intentar generación con el SDK oficial de Google GenAI
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        for modelo in MODELOS_RESERVA:
+            print(f"🤖 Intentando generación con SDK de Gemini ({modelo})...")
+            try:
+                response = client.models.generate_content(
+                    model=modelo,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json"
+                    )
+                )
+                raw_text = response.text.strip()
+                if raw_text.startswith("```"):
+                    raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+                articulo = json.loads(raw_text)
+                print(f"✅ ¡Éxito con el SDK de Gemini ({modelo})!")
+                return articulo["titulo"], articulo["contenido_html"]
+            except Exception as e:
+                print(f"⚠️ Error con SDK en {modelo}: {e}")
+    except ImportError:
+        print("ℹ️ SDK google-genai no disponible, pasando a petición REST...")
+
+    # 2. Respaldo por HTTP REST directo si el SDK no estuviera disponible
     headers = {"Content-Type": "application/json"}
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "response_mime_type": "application/json"
-        }
+        "generationConfig": {"response_mime_type": "application/json"}
     }
 
     ultimo_error = ""
+    for modelo in MODELOS_RESERVA:
+        url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){modelo}:generateContent?key={GEMINI_API_KEY}"
+        print(f"🤖 Probando HTTP REST directo con modelo: {modelo}...")
 
-    # Probamos las versiones de API y la lista de modelos hasta dar con uno activo
-    for api_version in API_VERSIONS:
-        for modelo in MODELOS_RESERVA:
-            url = f"https://generativelanguage.googleapis.com/{api_version}/models/{modelo}:generateContent?key={GEMINI_API_KEY}"
-            print(f"🤖 Probando [{api_version}] con modelo IA: {modelo}...")
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=40)
+            if response.status_code == 200:
+                res_data = response.json()
+                raw_text = res_data['candidates'][0]['content']['parts'][0]['text'].strip()
+                if raw_text.startswith("```"):
+                    raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+                articulo = json.loads(raw_text)
+                print(f"✅ ¡Éxito vía HTTP REST con {modelo}!")
+                return articulo["titulo"], articulo["contenido_html"]
+            else:
+                ultimo_error = f"Código {response.status_code}: {response.text}"
+                print(f"⚠️ {modelo} devolvió {response.status_code}. Probando siguiente...")
+        except Exception as e:
+            ultimo_error = str(e)
+            print(f"⚠️ Excepción HTTP con {modelo}: {e}")
 
-            try:
-                response = requests.post(url, headers=headers, json=payload, timeout=40)
-                if response.status_code == 200:
-                    res_data = response.json()
-                    raw_text = res_data['candidates'][0]['content']['parts'][0]['text'].strip()
-                    if raw_text.startswith("```"):
-                        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-                    articulo = json.loads(raw_text)
-                    print(f"✅ ¡Éxito con {modelo} [{api_version}]! Artículo generado por la IA.")
-                    return articulo["titulo"], articulo["contenido_html"]
-                elif response.status_code == 429:
-                    print(f"⚠️ Cuota temporal alcanzada en {modelo}. Probando siguiente modelo...")
-                    ultimo_error = f"Código 429 (Límite de cuota): {response.text}"
-                    time.sleep(5)
-                else:
-                    ultimo_error = f"Código {response.status_code}: {response.text}"
-                    print(f"⚠️ [{api_version}] {modelo} devolvió {response.status_code}. Probando siguiente...")
-            except Exception as e:
-                ultimo_error = str(e)
-                print(f"⚠️ Excepción con {modelo}: {e}")
-
-    raise Exception(f"ERROR CRÍTICO: Ningún modelo de Gemini respondió con 200 OK. Último error: {ultimo_error}")
+    raise Exception(f"ERROR CRÍTICO: Ningún modelo pudo generar el artículo. Último error: {ultimo_error}")
 
 def enviar_por_email_a_wordpress(titulo, contenido_html):
     print(f"📧 Preparando envío de correo...")
