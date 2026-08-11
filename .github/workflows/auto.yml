@@ -2,39 +2,30 @@ name: Automata Virales Miri Email
 
 on:
   schedule:
-    # Se ejecuta automáticamente cada 6 horas
-    - cron: '0 */6 * * *'
-  workflow_dispatch:
+    - cron: '0 */6 * * *'  # Se ejecuta automáticamente cada 6 horas
+  workflow_dispatch:        # Permite la ejecución manual con botón
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - name: Descargar codigo
-        uses: actions/checkout@v3
+      - name: Descargar código del repositorio
+        uses: actions/checkout@v4
 
-      - name: Configurar Python
-        uses: actions/setup-python@v4
+      - name: Configurar entorno Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Instalar librerias
-        run: pip install -r requirements.txt
+      - name: Instalar librerías necesarias
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-genai requests
 
-      - name: Ejecutar Robot
+      - name: Ejecutar el Robot de Miri
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
           WP_SECRET_EMAIL: ${{ secrets.WP_SECRET_EMAIL }}
         run: python bot_virales_email.py
-
-      - name: Guardar Historial
-        run: |
-          git config --global user.name "Miri Bot"
-          git config --global user.email "bot@miritelocuenta.com"
-          git add historial_temas.json
-          git commit -m "Actualizar temas [skip ci]" || exit 0
-          git push
