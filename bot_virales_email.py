@@ -5,7 +5,6 @@ import time
 import textwrap
 import html
 import random
-import urllib.parse
 import xml.etree.ElementTree as ET
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
@@ -20,7 +19,7 @@ WP_URL = (os.environ.get("WP_URL") or "").strip().rstrip("/")
 WP_USER = (os.environ.get("WP_USER") or "").strip()
 WP_APP_PASS = (os.environ.get("WP_APP_PASS") or "").strip().replace(" ", "")
 
-# Credenciales de Email (WP Post-by-Email)
+# Credenciales de Email (Post-by-Email)
 GMAIL_USER = (os.environ.get("GMAIL_USER") or "").strip()
 GMAIL_APP_PASS = (os.environ.get("GMAIL_APP_PASS") or "").strip()
 WP_SECRET_EMAIL = (os.environ.get("WP_SECRET_EMAIL") or "").strip()
@@ -36,13 +35,13 @@ HEADERS_BROWSER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 }
 
-# Colección de fotografías HD garantizadas de fotorrealismo (Plató, prensa, televisión, espectáculos)
-FOTOS_ESTUDIO_GARANTIZADAS = [
-    "https://images.unsplash.com/photo-1598899134739-24c46f58b8c0?w=1200&h=630&fit=crop", # Plató de TV / Iluminación
-    "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=1200&h=630&fit=crop", # Micrófono de prensa / escenario
-    "https://images.unsplash.com/photo-1522869635100-9f4c5e86aa37?w=1200&h=630&fit=crop", # Pantalla de televisión / Focos
-    "https://images.unsplash.com/photo-1514525253161-7a46d19cd819?w=1200&h=630&fit=crop", # Evento de luces brillantes
-    "https://images.unsplash.com/photo-1516321318423-f06f85e504b3?w=1200&h=630&fit=crop"  # Focos de estudio neón
+# Fotografías de stock con Licencia Comercial Libre (Unsplash License - 100% Legal)
+FOTOS_LIBRES_LICENCIADAS = [
+    "https://images.unsplash.com/photo-1598899134739-24c46f58b8c0?w=1200&h=630&fit=crop", # Plató de TV / Focos
+    "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=1200&h=630&fit=crop", # Escenario / Prensa
+    "https://images.unsplash.com/photo-1522869635100-9f4c5e86aa37?w=1200&h=630&fit=crop", # Luces de estudio
+    "https://images.unsplash.com/photo-1514525253161-7a46d19cd819?w=1200&h=630&fit=crop", # Eventos / Luces
+    "https://images.unsplash.com/photo-1611162617213-7d7a39e9b1d7?w=1200&h=630&fit=crop"  # Redes Sociales / Smartphones
 ]
 
 def cargar_historial():
@@ -79,7 +78,6 @@ def obtener_nuevo_tema_viral():
     return None
 
 def obtener_modelos_disponibles():
-    """Consulta dinámicamente qué modelos de Gemini están activos."""
     url_list = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
     try:
         res = requests.get(url_list, timeout=10)
@@ -98,44 +96,12 @@ def obtener_modelos_disponibles():
         pass
     return ["gemini-1.5-flash", "gemini-1.5-pro"]
 
-def generar_prompt_imagen_ai(tema_viral, modelos):
-    """
-    Pide a Gemini redactar una descripción visual FOTORREALISTA en inglés
-    para que la imagen generada por IA sea una foto fotorrealista y luminosa.
-    """
-    prompt = f"""
-    Lee esta noticia: "{tema_viral}"
-    Crea una descripción visual corta en inglés (máximo 12 palabras) para generar una imagen de fondo FOTORREALISTA, brillante, clara y muy iluminada de estilo prensa rosa/TV.
-    Describe el escenario, luces o concepto clave.
-    Ejemplos:
-    - Si habla de programa de juegos -> "brightly lit television game show studio set with vivid colors, HD photo"
-    - Si habla de debate/prensa -> "bright television news studio interview desk with broadcast lights, HD photo"
-    - Si habla de conciertos/cantante -> "bright music concert stage with neon lights and crowd, HD photo"
-
-    Responde ÚNICAMENTE con la frase en inglés.
-    """
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    headers = {"Content-Type": "application/json"}
-
-    for modelo in modelos:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={GEMINI_API_KEY}"
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=15)
-            if r.status_code == 200:
-                p_text = r.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-                p_limpio = p_text.replace('"', '').replace("'", "")
-                print(f"🎨 Prompt de IA generado para la imagen fotorrealista: '{p_limpio}'")
-                return p_limpio
-        except Exception:
-            continue
-    return "brightly lit television broadcast studio set with vivid colors, HD photo"
-
 def generar_articulo_miri(tema_viral):
     modelos = obtener_modelos_disponibles()
     
     prompt = f"""
     Eres la redactora principal del portal "Miri te lo cuenta".
-    Escribe un artículo ameno, cotilla, fresco, impecable sobre la siguiente tendencia:
+    Escribe un artículo ameno, cotilla, fresco e impecable sobre la siguiente tendencia:
     "{tema_viral}"
 
     REQUISITOS DEL TÍTULO:
@@ -169,57 +135,31 @@ def generar_articulo_miri(tema_viral):
                 articulo = json.loads(raw_text)
                 
                 titulo_limpio = html.unescape(articulo["titulo"]).strip().strip('"').strip("'")
-                prompt_foto = generar_prompt_imagen_ai(tema_viral, modelos)
-                return titulo_limpio, articulo["contenido_html"], prompt_foto
+                return titulo_limpio, articulo["contenido_html"]
         except Exception:
             continue
 
     raise Exception("Error crítico: Ningún modelo de Gemini pudo generar el artículo.")
 
-def descargar_foto_fondo(prompt_ingles):
-    """
-    Intenta descargar una fotografía real conceptual o utiliza el catálogo curado de fotorrealismo.
-    Se han borrado totalmente los diseños gráficos de respaldo.
-    """
-    print(f"🖼️ Buscando fotografía temática en la red basada en: '{prompt_ingles}'...")
-    
-    # 1. Intento de Generación Fotorrealista por IA (Pollinations)
-    prompt_encoded = urllib.parse.quote(prompt_ingles)
-    seed_azar = random.randint(100, 99999)
-    url_pollinations = f"[https://image.pollinations.ai/prompt/](https://image.pollinations.ai/prompt/){prompt_encoded}?width=1200&height=630&seed={seed_azar}&nologo=true&enhance=true"
-    
+def descargar_foto_fondo_legal():
+    """Descarga únicamente imágenes con licencia comercial 100% libre y segura."""
+    url_foto = random.choice(FOTOS_LIBRES_LICENCIADAS)
     try:
-        res = requests.get(url_pollinations, headers=HEADERS_BROWSER, timeout=18)
-        if res.status_code == 200 and len(res.content) > 15000:
-            img = Image.open(BytesIO(res.content)).convert("RGBA")
-            print("✅ Fotografía temática fotorrealista obtenida de la IA.")
-            return img
+        r = requests.get(url_foto, headers=HEADERS_BROWSER, timeout=12)
+        if r.status_code == 200 and len(r.content) > 10000:
+            return Image.open(BytesIO(r.content)).convert("RGBA")
     except Exception as e:
-        print(f"⚠️ IA de imágenes falló: {e}. Probando catálogo curado...")
+        print(f"⚠️ Error cargando foto libre: {e}")
 
-    # 2. Respaldo definitivo con fotografías HD de estudio luminosas (Garantía de FOTO 100%)
-    print("📸 Descargando fotografía temática fotorrealista de stock curado...")
-    for url_unsplash in random.sample(FOTOS_ESTUDIO_GARANTIZADAS, len(FOTOS_ESTUDIO_GARANTIZADAS)):
-        try:
-            r_u = requests.get(url_unsplash, headers=HEADERS_BROWSER, timeout=10)
-            if r_u.status_code == 200 and len(r_u.content) > 10000:
-                img = Image.open(BytesIO(r_u.content)).convert("RGBA")
-                print("✅ Fotografía fotorrealista de respaldo descargada con éxito.")
-                return img
-        except Exception:
-            continue
+    # Fondo neutro de estudio en caso de fallo de red
+    return Image.new("RGBA", (1200, 630), (35, 35, 40, 255))
 
-    # 3. Lienzo de estudio luminosos si todo lo anterior falla
-    print("✨ Lienzo de estudio fotorrealista luminoso como último recurso...")
-    return Image.new("RGBA", (1200, 630), (220, 220, 225, 255))
-
-def crear_imagen_destacada(titulo, prompt_foto):
-    """Garantiza la creación de la miniatura sobre un fondo FOTORREALISTA."""
+def crear_imagen_destacada(titulo):
     width, height = 1200, 630
-    bg_img = descargar_foto_fondo(prompt_foto)
+    bg_img = descargar_foto_fondo_legal()
 
-    # Filtro oscuro suave (25% opacidad) para resaltar el texto sin tapar la foto
-    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 65))
+    # Oscurecer suavemente la foto para que el texto destaque
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 80))
     img = Image.alpha_composite(bg_img, overlay)
     draw = ImageDraw.Draw(img)
 
@@ -227,11 +167,11 @@ def crear_imagen_destacada(titulo, prompt_foto):
     box_x1, box_y1 = margin, 120
     box_x2, box_y2 = width - margin, height - 80
 
-    # Sombra negra y caja amarilla principal
+    # Sombra negra y caja amarilla
     draw.rectangle([box_x1 + 8, box_y1 + 8, box_x2 + 8, box_y2 + 8], fill=(22, 22, 22, 255))
     draw.rectangle([box_x1, box_y1, box_x2, box_y2], fill=(255, 216, 77, 255), outline=(22, 22, 22, 255), width=5)
 
-    # Placa distintiva superior izquierda "MIRI TE LO CUENTA"
+    # Placa distintiva "MIRI TE LO CUENTA"
     badge_x1, badge_y1 = margin + 20, 50
     badge_x2, badge_y2 = margin + 380, 100
     draw.rectangle([badge_x1 + 4, badge_y1 + 4, badge_x2 + 4, badge_y2 + 4], fill=(22, 22, 22, 255))
@@ -252,11 +192,10 @@ def crear_imagen_destacada(titulo, prompt_foto):
 
     img_filename = "miniatura_destacada.jpg"
     img.convert("RGB").save(img_filename, "JPEG", quality=92)
-    print("✅ Miniatura FOTORREALISTA de calidad ensamblada correctamente.")
+    print("✅ Portada 100% legal generada con éxito.")
     return img_filename
 
 def publicar_en_wordpress(titulo, contenido_html, ruta_imagen):
-    # Opción REST
     if WP_URL and WP_USER and WP_APP_PASS:
         try:
             print("🚀 Publicando vía API REST de WordPress...")
@@ -291,14 +230,13 @@ def publicar_en_wordpress(titulo, contenido_html, ruta_imagen):
 
             r_post = requests.post(url_posts, json=payload, headers={"Content-Type": "application/json"}, auth=(WP_USER, WP_APP_PASS), timeout=30)
             if r_post.status_code in [200, 201]:
-                print("🎉 ¡Publicado con éxito en WordPress vía API REST!")
+                print("🎉 Publicado con éxito vía API REST.")
                 return True
         except Exception as e:
-            print(f"⚠️ Falló la publicación por API REST: {e}")
+            print(f"⚠️ API REST falló: {e}")
 
-    # Opción Correo Secreto
     if GMAIL_USER and GMAIL_APP_PASS and WP_SECRET_EMAIL:
-        print("📧 Publicando vía correo electrónico en WordPress...")
+        print("📧 Publicando vía correo secreto...")
         msg = MIMEMultipart()
         msg['From'] = GMAIL_USER
         msg['To'] = WP_SECRET_EMAIL
@@ -318,10 +256,10 @@ def publicar_en_wordpress(titulo, contenido_html, ruta_imagen):
         server.login(GMAIL_USER, GMAIL_APP_PASS)
         server.send_message(msg)
         server.quit()
-        print("🎉 ¡Correo enviado con éxito a WordPress!")
+        print("🎉 Correo enviado con éxito a WordPress.")
         return True
 
-    raise Exception("Faltan credenciales de publicación.")
+    raise Exception("Sin credenciales de publicación.")
 
 if __name__ == "__main__":
     tema = obtener_nuevo_tema_viral()
@@ -330,8 +268,8 @@ if __name__ == "__main__":
         tema = "Tendencias y polémica viral de la semana en redes sociales"
 
     print(f"🔥 Tema seleccionado: {tema}")
-    titulo, contenido_html, prompt_foto = generar_articulo_miri(tema)
-    ruta_imagen = crear_imagen_destacada(titulo, prompt_foto)
+    titulo, contenido_html = generar_articulo_miri(tema)
+    ruta_imagen = crear_imagen_destacada(titulo)
 
     if titulo and contenido_html and ruta_imagen:
         publicado = publicar_en_wordpress(titulo, contenido_html, ruta_imagen)
