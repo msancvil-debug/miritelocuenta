@@ -89,22 +89,12 @@ def obtener_modelos_disponibles():
     return ["gemini-1.5-flash", "gemini-1.5-pro"]
 
 def generar_prompt_imagen_ai(tema_viral, modelos):
-    """
-    Analiza la noticia y extrae los elementos visuales concretos (logos de TikTok, Meta,
-    pantallas de móvil, mapas, personajes, etc.) para que la imagen represente FIELMENTE el tema.
-    """
     prompt = f"""
-    Lee atentamente esta noticia: "{tema_viral}"
-    Crea una descripción visual en inglés (máximo 15 palabras) que represente LOS ELEMENTOS EXACTOS de la noticia.
-    REGLAS:
-    - Si habla de aplicaciones (TikTok, Meta, Instagram, WhatsApp): incluye sus nombres y logos o pantallas de smartphone.
-    - Si habla de una ciudad/país/lugar (Ceuta, España, Madrid): menciona mapas, símbolos o ubicación digital.
-    - Si habla de famosos o personajes: describe a la persona en un entorno editorial moderno.
-    - Estilo siempre: "bright high resolution editorial digital illustration, vivid colors, HD photo"
-
-    EJEMPLOS:
-    - Para TikTok/Meta/Ceuta -> "TikTok and Meta social media icons on smartphone screen with digital news background, vivid HD"
-    - Para Televisión/Reality -> "vibrant television studio stage with glowing lights, HD news photo"
+    Lee esta noticia: "{tema_viral}"
+    Crea una descripción visual en inglés (máximo 12 palabras) que represente los elementos clave para una imagen editorial.
+    Ejemplos:
+    - TikTok/Meta/Ceuta -> "3D TikTok and Meta social media icons on smartphone screen, digital news studio background"
+    - Televisión -> "vibrant entertainment news television studio stage with bright neon lights"
 
     Responde ÚNICAMENTE con la frase en inglés.
     """
@@ -118,11 +108,11 @@ def generar_prompt_imagen_ai(tema_viral, modelos):
             if r.status_code == 200:
                 p_text = r.json()['candidates'][0]['content']['parts'][0]['text'].strip()
                 p_limpio = p_text.replace('"', '').replace("'", "")
-                print(f"🎨 Prompt hiper-específico generado por la IA: '{p_limpio}'")
+                print(f"🎨 Prompt de IA generado para la imagen: '{p_limpio}'")
                 return p_limpio
         except Exception:
             continue
-    return "social media applications and mobile phone news alert, bright vivid HD illustration"
+    return "social media applications on smartphone screen, bright digital news illustration"
 
 def generar_articulo_miri(tema_viral):
     modelos = obtener_modelos_disponibles()
@@ -170,38 +160,49 @@ def generar_articulo_miri(tema_viral):
 
     raise Exception("Error crítico: Ningún modelo de Gemini pudo generar el artículo.")
 
-def crear_fondo_luminoso_marca(width, height):
-    """Fondo limpio y corporativo de Miri (sin fotos raras de stock)."""
-    img = Image.new("RGBA", (width, height), (255, 247, 239, 255))
-    draw = ImageDraw.Draw(img)
+def crear_fondo_estilizado_marca(width=1200, height=630):
+    """Crea un fondo gráfico abstracto, moderno y vibrante estilo plantilla corporativa de Miri."""
+    base = Image.new("RGBA", (width, height), (26, 11, 46, 255))
+    draw = ImageDraw.Draw(base)
 
-    draw.rectangle([0, 0, width, 15], fill=(240, 68, 56, 255))
-    draw.rectangle([0, 15, width, 25], fill=(255, 216, 77, 255))
-    draw.rectangle([0, height - 15, width, height], fill=(22, 22, 22, 255))
+    # Degradado suave por franjas
+    for y in range(height):
+        r = int(26 + (65 - 26) * (y / height))
+        g = int(11 + (15 - 11) * (y / height))
+        b = int(46 + (75 - 46) * (y / height))
+        draw.line([(0, y), (width, y)], fill=(r, g, b, 255))
 
-    return img
+    # Formas geométricas de neón
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw_overlay = ImageDraw.Draw(overlay)
+    
+    draw_overlay.ellipse([750, -100, 1300, 450], fill=(255, 216, 77, 45))
+    draw_overlay.ellipse([850, -50, 1200, 350], fill=(240, 68, 56, 65))
+
+    for i in range(-200, width + 400, 90):
+        draw_overlay.line([(i, 0), (i - 300, height)], fill=(255, 255, 255, 10), width=3)
+
+    return Image.alpha_composite(base, overlay)
 
 def descargar_foto_ia(prompt_ingles):
-    """Genera la imagen conceptual exacta del tema usando motor turbo ultrarrápido."""
-    print(f"🖼️ Generando imagen temática específica por IA: '{prompt_ingles}'...")
+    """Genera la imagen conceptual por IA o utiliza el fondo estilizado de marca si la API no responde."""
+    print(f"🖼️ Solicitando imagen de IA para: '{prompt_ingles}'...")
     
     prompt_encoded = urllib.parse.quote(prompt_ingles)
     seed_azar = random.randint(100, 99999)
-    # Usamos model=turbo para generación ultra rápida que no caduca en GitHub Actions
-    url_pollinations = f"[https://image.pollinations.ai/prompt/](https://image.pollinations.ai/prompt/){prompt_encoded}?width=1200&height=630&seed={seed_azar}&nologo=true&model=turbo"
+    url_pollinations = f"[https://image.pollinations.ai/prompt/](https://image.pollinations.ai/prompt/){prompt_encoded}?width=1200&height=630&seed={seed_azar}&nologo=true"
 
     try:
-        res = requests.get(url_pollinations, headers=HEADERS_BROWSER, timeout=20)
+        res = requests.get(url_pollinations, headers=HEADERS_BROWSER, timeout=18)
         if res.status_code == 200 and len(res.content) > 12000:
             img = Image.open(BytesIO(res.content)).convert("RGBA")
             print("✅ Imagen temática generada con éxito por la IA.")
             return img
     except Exception as e:
-        print(f"⚠️ Generación directa de IA tardó demasiado: {e}.")
+        print(f"⚠️ La API de IA no respondió a tiempo: {e}.")
 
-    # Si la API no responde, usa el lienzo de marca limpio (NUNCA fotos de escaletas o cámaras)
-    print("✨ Utilizando plantilla gráfica limpia de marca...")
-    return crear_fondo_luminoso_marca(1200, 630)
+    print("✨ Aplicando plantilla gráfica vibrante de marca...")
+    return crear_fondo_estilizado_marca(1200, 630)
 
 def crear_imagen_destacada(titulo, prompt_foto):
     width, height = 1200, 630
