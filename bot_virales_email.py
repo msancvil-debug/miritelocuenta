@@ -19,11 +19,6 @@ WP_URL = (os.environ.get("WP_URL") or "").strip().rstrip("/")
 WP_USER = (os.environ.get("WP_USER") or "").strip()
 WP_APP_PASS = (os.environ.get("WP_APP_PASS") or "").strip().replace(" ", "")
 
-# Variables Canva Connect API (Pro)
-CANVA_CLIENT_ID = (os.environ.get("CANVA_CLIENT_ID") or "").strip()
-CANVA_CLIENT_SECRET = (os.environ.get("CANVA_CLIENT_SECRET") or "").strip()
-CANVA_TEMPLATE_ID = (os.environ.get("CANVA_TEMPLATE_ID") or "").strip()
-
 # Credenciales Email Secreto WordPress (Fallback)
 GMAIL_USER = (os.environ.get("GMAIL_USER") or "").strip()
 GMAIL_APP_PASS = (os.environ.get("GMAIL_APP_PASS") or "").strip()
@@ -40,7 +35,7 @@ HEADERS_BROWSER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 }
 
-# Colección de fotografías HD temáticas para respaldo en Canva
+# Fotografías de stock temáticas de alta calidad y licencias libres
 FOTOS_STOCK_TEMATICAS = [
     "https://images.unsplash.com/photo-1598899134739-24c46f58b8c0?w=1200&h=630&fit=crop",
     "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=1200&h=630&fit=crop",
@@ -100,27 +95,6 @@ def obtener_modelos_disponibles():
         pass
     return ["gemini-1.5-flash", "gemini-1.5-pro"]
 
-def extraer_keyword_foto(tema_viral, modelos):
-    prompt = f"""
-    Noticia: "{tema_viral}"
-    Extrae 1 palabra clave simple en inglés sobre el tema principal o personaje para buscar una foto en Canva.
-    Ejemplos: "television", "celebrity", "singer", "money", "studio".
-    Responde ÚNICAMENTE con la palabra en inglés.
-    """
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    headers = {"Content-Type": "application/json"}
-
-    for modelo in modelos:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={GEMINI_API_KEY}"
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=15)
-            if r.status_code == 200:
-                kw = r.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-                return kw.replace('"', '').replace("'", "")
-        except Exception:
-            continue
-    return "television"
-
 def generar_articulo_miri(tema_viral):
     modelos = obtener_modelos_disponibles()
     
@@ -160,72 +134,64 @@ def generar_articulo_miri(tema_viral):
                 articulo = json.loads(raw_text)
                 
                 titulo_limpio = html.unescape(articulo["titulo"]).strip().strip('"').strip("'")
-                keyword_foto = extraer_keyword_foto(tema_viral, modelos)
-                return titulo_limpio, articulo["contenido_html"], keyword_foto
+                return titulo_limpio, articulo["contenido_html"]
         except Exception:
             continue
 
     raise Exception("Error crítico: Ningún modelo de Gemini pudo generar el artículo.")
 
-def generar_miniatura_canva_pro(titulo, keyword_foto):
-    """Pide a la API Connect de Canva Pro que autorrellene tu plantilla."""
+def crear_imagen_destacada(titulo):
+    """Genera la miniatura profesional con faldón amarillo y foto de fondo de alta calidad."""
+    width, height = 1200, 630
     ruta_local = "miniatura_destacada.jpg"
 
-    if CANVA_CLIENT_ID and CANVA_CLIENT_SECRET and CANVA_TEMPLATE_ID:
-        try:
-            print(f"🎨 Conectando con Canva Pro API para autorrellenar la plantilla con '{keyword_foto}'...")
-            url_autofill = "[https://api.canva.com/v1/autofills](https://api.canva.com/v1/autofills)"
-            headers_canva = {
-                "Authorization": f"Bearer {CANVA_CLIENT_SECRET}",
-                "Content-Type": "application/json"
-            }
-            
-            # URL de foto temática libre de derechos para Canva
-            url_foto_fondo = random.choice(FOTOS_STOCK_TEMATICAS)
-            
-            payload_canva = {
-                "brand_template_id": CANVA_TEMPLATE_ID,
-                "data": {
-                    "TITULAR": {"type": "text", "text": titulo},
-                    "FONDO": {"type": "image", "url": url_foto_fondo}
-                }
-            }
-            res_canva = requests.post(url_autofill, headers=headers_canva, json=payload_canva, timeout=30)
-            if res_canva.status_code in [200, 201]:
-                job_id = res_canva.json().get("job", {}).get("id")
-                url_job = f"[https://api.canva.com/v1/autofills/](https://api.canva.com/v1/autofills/){job_id}"
-                
-                for _ in range(10):
-                    time.sleep(3)
-                    res_job = requests.get(url_job, headers=headers_canva, timeout=15)
-                    if res_job.status_code == 200:
-                        status = res_job.json().get("job", {}).get("status")
-                        if status == "success":
-                            export_url = res_job.json().get("job", {}).get("result", {}).get("design", {}).get("url")
-                            if export_url:
-                                r_img = requests.get(export_url, timeout=20)
-                                if r_img.status_code == 200:
-                                    with open(ruta_local, "wb") as f:
-                                        f.write(r_img.content)
-                                    print("🎉 ¡Miniatura oficial renderizada con éxito por Canva Pro!")
-                                    return ruta_local
-                        elif status == "failed":
-                            break
-        except Exception as e:
-            print(f"⚠️ Canva API no respondió a tiempo ({e}). Usando plantilla local de respaldo...")
-
-    # Generación de respaldo segura si no responde la API externa
-    img = Image.new("RGB", (1200, 630), (255, 216, 77))
-    draw = ImageDraw.Draw(img)
+    # Descargar foto de fondo temática segura
+    bg_img = None
     try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 32)
+        url_foto = random.choice(FOTOS_STOCK_TEMATICAS)
+        r = requests.get(url_foto, headers=HEADERS_BROWSER, timeout=12)
+        if r.status_code == 200 and len(r.content) > 10000:
+            bg_img = Image.open(BytesIO(r.content)).convert("RGBA")
     except Exception:
-        font = ImageFont.load_default()
-    
-    draw.text((50, 50), "MIRI TE LO CUENTA", fill=(240, 68, 56), font=font)
-    lineas = textwrap.wrap(titulo, width=35)
-    draw.multiline_text((50, 150), "\n".join(lineas[:4]), fill=(22, 22, 22), font=font, spacing=10)
-    img.save(ruta_local, "JPEG", quality=90)
+        pass
+
+    if not bg_img:
+        bg_img = Image.new("RGBA", (width, height), (35, 35, 40, 255))
+
+    # Oscurecer ligeramente para resaltar el texto
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 85))
+    img = Image.alpha_composite(bg_img, overlay)
+    draw = ImageDraw.Draw(img)
+
+    margin = 50
+    box_x1, box_y1 = margin, 120
+    box_x2, box_y2 = width - margin, height - 80
+
+    # Sombra y caja amarilla corporativa
+    draw.rectangle([box_x1 + 8, box_y1 + 8, box_x2 + 8, box_y2 + 8], fill=(22, 22, 22, 255))
+    draw.rectangle([box_x1, box_y1, box_x2, box_y2], fill=(255, 216, 77, 255), outline=(22, 22, 22, 255), width=5)
+
+    # Placa "MIRI TE LO CUENTA"
+    badge_x1, badge_y1 = margin + 20, 50
+    badge_x2, badge_y2 = margin + 380, 100
+    draw.rectangle([badge_x1 + 4, badge_y1 + 4, badge_x2 + 4, badge_y2 + 4], fill=(22, 22, 22, 255))
+    draw.rectangle([badge_x1, badge_y1, badge_x2, badge_y2], fill=(240, 68, 56, 255), outline=(22, 22, 22, 255), width=3)
+
+    try:
+        font_badge = ImageFont.truetype("DejaVuSans-Bold.ttf", 20)
+        font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 34)
+    except Exception:
+        font_badge = ImageFont.load_default()
+        font_title = ImageFont.load_default()
+
+    draw.text((badge_x1 + 15, badge_y1 + 12), "MIRI TE LO CUENTA", fill=(255, 255, 255, 255), font=font_badge)
+
+    lineas = textwrap.wrap(titulo, width=38)
+    texto_formateado = "\n".join(lineas[:4])
+    draw.multiline_text((box_x1 + 30, box_y1 + 35), texto_formateado, fill=(22, 22, 22, 255), font=font_title, spacing=12)
+
+    img.convert("RGB").save(ruta_local, "JPEG", quality=92)
+    print("✅ Miniatura corporativa generada con éxito.")
     return ruta_local
 
 def publicar_en_wordpress(titulo, contenido_html, ruta_imagen):
@@ -301,8 +267,8 @@ if __name__ == "__main__":
         tema = "Tendencias y polémica viral de la semana en redes sociales"
 
     print(f"🔥 Tema seleccionado: {tema}")
-    titulo, contenido_html, keyword_foto = generar_articulo_miri(tema)
-    ruta_imagen = generar_miniatura_canva_pro(titulo, keyword_foto)
+    titulo, contenido_html = generar_articulo_miri(tema)
+    ruta_imagen = crear_imagen_destacada(titulo)
 
     if titulo and contenido_html and ruta_imagen:
         publicado = publicar_en_wordpress(titulo, contenido_html, ruta_imagen)
