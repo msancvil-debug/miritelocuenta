@@ -32,11 +32,18 @@ HEADERS_BROWSER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
+# Amplia lista de modelos activos para probar automáticamente en orden
 MODELOS_RESERVA = [
+    "gemini-2.5-flash",
+    "gemini-1.5-flash",
     "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-    "gemini-2.0-flash-exp"
+    "gemini-1.5-pro",
+    "gemini-2.5-pro",
+    "gemini-1.5-flash-8b",
+    "gemini-1.5-flash-latest"
 ]
+
+API_VERSIONS = ["v1beta", "v1"]
 
 def cargar_historial():
     if os.path.exists(HISTORIAL_FILE):
@@ -74,42 +81,67 @@ def obtener_nuevo_tema_viral():
 
 def generar_articulo_miri(tema_viral):
     prompt = f"""
-    Eres la redactora principal de "Miri te lo cuenta".
-    Escribe un artículo ameno, explicativo y cotilla sobre el tema viral: "{tema_viral}".
-    Responde ÚNICAMENTE con un JSON válido:
+    Eres la redactora principal del proyecto "Miri te lo cuenta", un portal sobre tendencias de internet, vídeos virales, reality shows y cultura pop en redes sociales (TikTok, X, Instagram, YouTube).
+
+    Escribe un artículo ameno, explicativo, cotilla y optimizado para SEO sobre el siguiente tema viral:
+    "{tema_viral}"
+
+    REQUISITOS DEL ARTÍCULO Y ESTÉTICA NEO-BRUTALISTA (INLINE STYLES):
+    1. Tono: Fresco, cercano, directo y explicativo ("Te lo cuento detalladamente").
+    2. Todo el HTML DEBE llevar estilos en línea (inline styles) para mantener la estética Neo-brutalista de la web:
+       - Paleta de colores: Fondo Marfil (#FFF7EF), Bordes Negros (#161616), Amarillo (#FFD84D), Coral (#F04438).
+       - Cajas destacadas (Resumen o Claves): <div style="background-color: #FFD84D; border: 3px solid #161616; border-radius: 12px; padding: 16px; margin: 20px 0; box-shadow: 4px 4px 0px #161616;">
+       - Títulos h2: <h2 style="font-size: 22px; font-weight: 800; color: #161616; background-color: #FFF7EF; border-left: 6px solid #F04438; padding: 8px 12px; margin-top: 25px;">
+       - Títulos h3: <h3 style="font-size: 18px; font-weight: 700; color: #161616; margin-top: 20px;">
+       - Texto normal en párrafos: <p style="font-size: 16px; line-height: 1.6; color: #161616; margin-bottom: 15px;">
+       - Sección FAQ al final en una caja Neo-brutalista: <div style="background-color: #FFF7EF; border: 3px solid #161616; border-radius: 12px; padding: 18px; margin-top: 30px; box-shadow: 4px 4px 0px #161616;">
+    3. Responde ÚNICAMENTE con un objeto JSON válido (sin marcas markdown ni código extra).
+    
+    Formato JSON esperado:
     {{
       "titulo": "Título SEO aquí",
-      "contenido_html": "<p>Texto de introducción...</p><h2>¿Qué ha pasado?</h2><p>Contenido...</p>"
+      "contenido_html": "<p style='...'>Texto de introducción...</p><div style='...'>Resumen...</div>"
     }}
     """
+    
     headers = {"Content-Type": "application/json"}
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"response_mime_type": "application/json"}
+        "generationConfig": {
+            "response_mime_type": "application/json"
+        }
     }
 
     ultimo_error = ""
-    for modelo in MODELOS_RESERVA:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={GEMINI_API_KEY}"
-        print(f"🤖 Probando con el modelo IA: {modelo}...")
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=40)
-            if response.status_code == 200:
-                res_data = response.json()
-                raw_text = res_data['candidates'][0]['content']['parts'][0]['text'].strip()
-                if raw_text.startswith("```"):
-                    raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-                articulo = json.loads(raw_text)
-                print("✅ Artículo generado correctamente por la IA.")
-                return articulo["titulo"], articulo["contenido_html"]
-            else:
-                ultimo_error = f"Código {response.status_code}: {response.text}"
-                print(f"⚠️ El modelo {modelo} devolvió error: {ultimo_error}")
-        except Exception as e:
-            ultimo_error = str(e)
-            print(f"⚠️ Excepción en {modelo}: {e}")
 
-    raise Exception(f"ERROR CRÍTICO: Ningún modelo de Gemini pudo generar el artículo. Detalle: {ultimo_error}")
+    # Probamos las versiones de API y la lista de modelos hasta dar con uno activo
+    for api_version in API_VERSIONS:
+        for modelo in MODELOS_RESERVA:
+            url = f"https://generativelanguage.googleapis.com/{api_version}/models/{modelo}:generateContent?key={GEMINI_API_KEY}"
+            print(f"🤖 Probando [{api_version}] con modelo IA: {modelo}...")
+
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=40)
+                if response.status_code == 200:
+                    res_data = response.json()
+                    raw_text = res_data['candidates'][0]['content']['parts'][0]['text'].strip()
+                    if raw_text.startswith("```"):
+                        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+                    articulo = json.loads(raw_text)
+                    print(f"✅ ¡Éxito con {modelo} [{api_version}]! Artículo generado por la IA.")
+                    return articulo["titulo"], articulo["contenido_html"]
+                elif response.status_code == 429:
+                    print(f"⚠️ Cuota temporal alcanzada en {modelo}. Probando siguiente modelo...")
+                    ultimo_error = f"Código 429 (Límite de cuota): {response.text}"
+                    time.sleep(5)
+                else:
+                    ultimo_error = f"Código {response.status_code}: {response.text}"
+                    print(f"⚠️ [{api_version}] {modelo} devolvió {response.status_code}. Probando siguiente...")
+            except Exception as e:
+                ultimo_error = str(e)
+                print(f"⚠️ Excepción con {modelo}: {e}")
+
+    raise Exception(f"ERROR CRÍTICO: Ningún modelo de Gemini respondió con 200 OK. Último error: {ultimo_error}")
 
 def enviar_por_email_a_wordpress(titulo, contenido_html):
     print(f"📧 Preparando envío de correo...")
