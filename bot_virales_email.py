@@ -1,29 +1,17 @@
 import requests
 import json
 import os
-import smtplib
 import time
 import textwrap
 import xml.etree.ElementTree as ET
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.image import MIMEImage
 from PIL import Image, ImageDraw, ImageFont
+from io import BytesIO
 
-# Limpieza estricta de variables de entorno
+# 1. VARIABLES DE ENTORNO
 GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
-GMAIL_USER = (os.environ.get("GMAIL_USER") or "").strip()
-GMAIL_APP_PASS = (os.environ.get("GMAIL_APP_PASS") or "").strip().replace(" ", "")
-WP_SECRET_EMAIL = (os.environ.get("WP_SECRET_EMAIL") or "").strip()
-
-print("--- DIAGNÓSTICO DE VARIABLES DE ENTORNO ---")
-print(f"GEMINI_API_KEY: {'Detectada' if GEMINI_API_KEY else '❌ FALTA EN GITHUB SECRETS'}")
-print(f"GMAIL_USER: {GMAIL_USER if GMAIL_USER else '❌ FALTA EN GITHUB SECRETS'}")
-print(f"GMAIL_APP_PASS: {'Detectada' if GMAIL_APP_PASS else '❌ FALTA EN GITHUB SECRETS'}")
-print(f"WP_SECRET_EMAIL: {WP_SECRET_EMAIL if WP_SECRET_EMAIL else '❌ FALTA EN GITHUB SECRETS'}")
-
-if not all([GEMINI_API_KEY, GMAIL_USER, GMAIL_APP_PASS, WP_SECRET_EMAIL]):
-    raise Exception("ERROR CRÍTICO: Falta una o varias variables en GitHub Secrets.")
+WP_URL = (os.environ.get("WP_URL") or "").strip().rstrip("/")
+WP_USER = (os.environ.get("WP_USER") or "").strip()
+WP_APP_PASS = (os.environ.get("WP_APP_PASS") or "").strip().replace(" ", "")
 
 HISTORIAL_FILE = "historial_temas.json"
 FEEDS_TENDENCIAS = [
@@ -32,7 +20,7 @@ FEEDS_TENDENCIAS = [
 ]
 
 HEADERS_BROWSER = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
 }
 
 def cargar_historial():
@@ -55,7 +43,6 @@ def obtener_nuevo_tema_viral():
     historial = cargar_historial()
     for feed_url in FEEDS_TENDENCIAS:
         try:
-            print(f"📡 Intentando leer noticias de: {feed_url}...")
             res = requests.get(feed_url, headers=HEADERS_BROWSER, timeout=15)
             if res.status_code == 200:
                 root = ET.fromstring(res.content)
@@ -69,119 +56,97 @@ def obtener_nuevo_tema_viral():
             print(f"⚠️ Error leyendo feed {feed_url}: {e}")
     return None
 
-def obtener_modelos_disponibles():
-    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
-    modelos = []
+def obtener_palabras_clave_imagen(tema_viral):
+    """Pide a Gemini 2 palabras clave en inglés para buscar una foto temática real."""
+    prompt = f"Extrae 2 palabras clave sencillas en inglés separadas por coma para buscar una foto de stock libre de derechos representativa sobre esta noticia: '{tema_viral}' (Ejemplo: 'electricity,company' o 'television,studio'). Responde ÚNICAMENTE con las palabras clave."
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
     try:
-        res = requests.get(url, timeout=15)
-        if res.status_code == 200:
-            data = res.json()
-            for m in data.get("models", []):
-                methods = m.get("supportedGenerationMethods", [])
-                if "generateContent" in methods:
-                    name = m["name"].replace("models/", "")
-                    modelos.append(name)
-    except Exception as e:
-        print(f"⚠️ Excepción al consultar modelos: {e}")
-
-    if not modelos:
-        modelos = ["gemini-2.0-flash", "gemini-1.5-flash"]
-    return modelos
+        r = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=10)
+        if r.status_code == 200:
+            kw = r.json()['candidates'][0]['content']['parts'][0]['text'].strip().replace(" ", "")
+            return kw
+    except Exception:
+        pass
+    return "news,media"
 
 def generar_articulo_miri(tema_viral):
     prompt = f"""
-    Eres la redactora principal del proyecto "Miri te lo cuenta", un portal sobre tendencias de internet, vídeos virales, reality shows y cultura pop en redes sociales (TikTok, X, Instagram, YouTube).
-
+    Eres la redactora principal del proyecto "Miri te lo cuenta", un portal sobre tendencias de internet, vídeos virales, reality shows y cultura pop.
     Escribe un artículo ameno, explicativo, cotilla y optimizado para SEO sobre el siguiente tema viral:
     "{tema_viral}"
 
-    REQUISITOS DEL ARTÍCULO Y ESTÉTICA NEO-BRUTALISTA (INLINE STYLES):
+    REQUISITOS DEL ARTÍCULO:
     1. Tono: Fresco, cercano, directo y explicativo ("Te lo cuento detalladamente").
     2. Todo el HTML DEBE llevar estilos en línea (inline styles):
-       - Paleta de colores: Fondo Marfil (#FFF7EF), Bordes Negros (#161616), Amarillo (#FFD84D), Coral (#F04438).
+       - Paleta: Fondo Marfil (#FFF7EF), Bordes Negros (#161616), Amarillo (#FFD84D), Coral (#F04438).
        - Cajas destacadas: <div style="background-color: #FFD84D; border: 3px solid #161616; border-radius: 12px; padding: 16px; margin: 20px 0; box-shadow: 4px 4px 0px #161616;">
        - Títulos h2: <h2 style="font-size: 22px; font-weight: 800; color: #161616; background-color: #FFF7EF; border-left: 6px solid #F04438; padding: 8px 12px; margin-top: 25px;">
        - Títulos h3: <h3 style="font-size: 18px; font-weight: 700; color: #161616; margin-top: 20px;">
        - Texto normal: <p style="font-size: 16px; line-height: 1.6; color: #161616; margin-bottom: 15px;">
-       - Sección FAQ al final: <div style="background-color: #FFF7EF; border: 3px solid #161616; border-radius: 12px; padding: 18px; margin-top: 30px; box-shadow: 4px 4px 0px #161616;">
-    3. Responde ÚNICAMENTE con un objeto JSON válido (sin marcas markdown ni código extra).
-    
-    Formato JSON esperado:
+
+    Responde ÚNICAMENTE con un objeto JSON válido:
     {{
       "titulo": "Título SEO aquí",
       "contenido_html": "<p style='...'>Texto de introducción...</p><div style='...'>Resumen...</div>"
     }}
     """
-
     headers = {"Content-Type": "application/json"}
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"response_mime_type": "application/json"}
     }
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    res = requests.post(url, headers=headers, json=payload, timeout=40)
+    if res.status_code == 200:
+        raw_text = res.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+        if raw_text.startswith("```"):
+            raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+        articulo = json.loads(raw_text)
+        return articulo["titulo"], articulo["contenido_html"]
+    raise Exception(f"Error Gemini API ({res.status_code}): {res.text}")
 
-    modelos = obtener_modelos_disponibles()
-    ultimo_error = ""
-
-    for modelo in modelos:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={GEMINI_API_KEY}"
-        print(f"🤖 Generando artículo con modelo: {modelo}...")
-
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=40)
-            if response.status_code == 200:
-                res_data = response.json()
-                raw_text = res_data['candidates'][0]['content']['parts'][0]['text'].strip()
-                if raw_text.startswith("```"):
-                    raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-                articulo = json.loads(raw_text)
-                print(f"✅ Artículo generado con éxito ({modelo}).")
-                return articulo["titulo"], articulo["contenido_html"]
-        except Exception as e:
-            ultimo_error = str(e)
-
-    raise Exception(f"ERROR CRÍTICO: No se pudo generar el artículo. {ultimo_error}")
-
-def crear_imagen_destacada(titulo):
-    """
-    Descarga una imagen libre de derechos de Unsplash/Picsum,
-    y dibuja encima la tarjeta Neo-brutalista con el titular.
-    """
-    print("🎨 Creando imagen destacada con titular para redes sociales...")
-    width, height = 1200, 630  # Medidas estándar para previas de redes (Open Graph)
+def crear_imagen_destacada(titulo, tema_viral):
+    width, height = 1200, 630
+    keywords = obtener_palabras_clave_imagen(tema_viral)
+    print(f"🖼️ Buscando fotografía de stock temática relacionada con: '{keywords}'...")
     
-    # 1. Obtener imagen de fondo de stock (libre de derechos)
-    try:
-        url_stock = "[https://picsum.photos/1200/630](https://picsum.photos/1200/630)"
-        res = requests.get(url_stock, headers=HEADERS_BROWSER, timeout=15)
-        if res.status_code == 200:
-            from io import BytesIO
-            bg_img = Image.open(BytesIO(res.content)).convert("RGBA")
-        else:
-            bg_img = Image.new("RGBA", (width, height), (255, 247, 239, 255))
-    except Exception:
-        bg_img = Image.new("RGBA", (width, height), (255, 247, 239, 255))
+    bg_img = None
+    urls_stock = [
+        f"[https://loremflickr.com/1200/630/](https://loremflickr.com/1200/630/){keywords}",
+        "[https://loremflickr.com/1200/630/news,media](https://loremflickr.com/1200/630/news,media)"
+    ]
+    
+    for url in urls_stock:
+        try:
+            res = requests.get(url, headers=HEADERS_BROWSER, timeout=12)
+            if res.status_code == 200 and len(res.content) > 5000:
+                bg_img = Image.open(BytesIO(res.content)).convert("RGBA")
+                break
+        except Exception:
+            continue
 
-    # 2. Aplicar capa oscura sobre la foto para mejorar lectura
-    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 120))
+    if not bg_img:
+        bg_img = Image.new("RGBA", (width, height), (30, 30, 35, 255))
+
+    # Oscurecer suavemente el fondo para resaltar la lectura
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 110))
     img = Image.alpha_composite(bg_img, overlay)
     draw = ImageDraw.Draw(img)
 
-    # 3. Dibujar caja Neo-brutalista (Amarillo #FFD84D con borde negro)
     margin = 50
     box_x1, box_y1 = margin, 120
     box_x2, box_y2 = width - margin, height - 80
 
-    # Sombra negra de la caja
+    # Sombra y caja amarilla del titular
     draw.rectangle([box_x1 + 8, box_y1 + 8, box_x2 + 8, box_y2 + 8], fill=(22, 22, 22, 255))
-    # Caja amarilla principal
     draw.rectangle([box_x1, box_y1, box_x2, box_y2], fill=(255, 216, 77, 255), outline=(22, 22, 22, 255), width=5)
 
-    # 4. Dibujar distintivo superior de Marca: "MIRI TE LO CUENTA | TENDENCIAS"
+    # Distintivo "MIRI TE LO CUENTA"
     badge_x1, badge_y1 = margin + 20, 50
     badge_x2, badge_y2 = margin + 380, 100
     draw.rectangle([badge_x1 + 4, badge_y1 + 4, badge_x2 + 4, badge_y2 + 4], fill=(22, 22, 22, 255))
     draw.rectangle([badge_x1, badge_y1, badge_x2, badge_y2], fill=(240, 68, 56, 255), outline=(22, 22, 22, 255), width=3)
-    
+
     try:
         font_badge = ImageFont.truetype("DejaVuSans-Bold.ttf", 20)
         font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 36)
@@ -191,57 +156,60 @@ def crear_imagen_destacada(titulo):
 
     draw.text((badge_x1 + 15, badge_y1 + 12), "MIRI TE LO CUENTA", fill=(255, 255, 255, 255), font=font_badge)
 
-    # 5. Formatear y envolver el Titular para que quepa en la caja
     lineas = textwrap.wrap(titulo, width=38)
-    texto_formateado = "\n".join(lineas[:4]) # Máximo 4 líneas
-
+    texto_formateado = "\n".join(lineas[:4])
     draw.multiline_text((box_x1 + 30, box_y1 + 35), texto_formateado, fill=(22, 22, 22, 255), font=font_title, spacing=12)
 
-    # 6. Guardar imagen resultante
     img_filename = "miniatura_destacada.jpg"
     img.convert("RGB").save(img_filename, "JPEG", quality=90)
-    print("🖼️ Miniatura con titular creada correctamente.")
+    print("🖼️ Imagen de portada generada correctamente sobre fotografía temática.")
     return img_filename
 
-def enviar_por_email_a_wordpress(titulo, contenido_html, ruta_imagen):
-    print(f"📧 Preparando envío de correo con miniatura adjunta...")
-    
-    # Para que la imagen también aparezca dentro del cuerpo del artículo
-    html_con_imagen = f"""
+def subir_imagen_wordpress(ruta_imagen):
+    print("📤 Subiendo foto a la Biblioteca de Medios de WordPress...")
+    url_media = f"{WP_URL}/wp-json/wp/v2/media"
+    with open(ruta_imagen, "rb") as f:
+        media_data = f.read()
+    headers = {
+        "Content-Disposition": f"attachment; filename={os.path.basename(ruta_imagen)}",
+        "Content-Type": "image/jpeg"
+    }
+    response = requests.post(url_media, data=media_data, headers=headers, auth=(WP_USER, WP_APP_PASS), timeout=30)
+    if response.status_code in [200, 201]:
+        res_json = response.json()
+        return res_json.get("id"), res_json.get("source_url")
+    return None, None
+
+def publicar_articulo_wordpress(titulo, contenido_html, media_id, url_imagen_publica):
+    print("🚀 Publicando artículo en WordPress vía API REST...")
+    url_posts = f"{WP_URL}/wp-json/wp/v2/posts"
+
+    # Insertar la foto con URL pública en la primera línea para que Metricool la detecte al 100% por RSS
+    html_con_imagen_publica = f"""
     <div style="margin-bottom: 25px; text-align: center;">
-      <img src="cid:miniatura_header" style="max-width: 100%; height: auto; border: 3px solid #161616; border-radius: 12px; box-shadow: 4px 4px 0px #161616;" alt="{titulo}" />
+        <img src="{url_imagen_publica}" style="max-width: 100%; height: auto; border: 3px solid #161616; border-radius: 12px; box-shadow: 4px 4px 0px #161616;" alt="{titulo}" />
     </div>
     {contenido_html}
     """
 
-    msg = MIMEMultipart('related')
-    msg['From'] = GMAIL_USER
-    msg['To'] = WP_SECRET_EMAIL
-    msg['Subject'] = titulo
+    payload = {
+        "title": titulo,
+        "content": html_con_imagen_publica,
+        "status": "publish"
+    }
 
-    msg_alt = MIMEMultipart('alternative')
-    msg.attach(msg_alt)
-    msg_alt.attach(MIMEText(html_con_imagen, 'html'))
+    if media_id:
+        payload["featured_media"] = media_id
 
-    # Adjuntar archivo de imagen
-    if os.path.exists(ruta_imagen):
-        with open(ruta_imagen, 'rb') as f:
-            img_data = f.read()
-            img_part = MIMEImage(img_data)
-            img_part.add_header('Content-ID', '<miniatura_header>')
-            img_part.add_header('Content-Disposition', 'inline', filename=os.path.basename(ruta_imagen))
-            msg.attach(img_part)
+    headers = {"Content-Type": "application/json"}
+    response = requests.post(url_posts, json=payload, headers=headers, auth=(WP_USER, WP_APP_PASS), timeout=30)
 
-    try:
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
-        server.login(GMAIL_USER, GMAIL_APP_PASS)
-        server.send_message(msg)
-        server.quit()
-        print("🎉 ÉXITO TOTAL: Artículo e imagen enviados a WordPress.")
+    if response.status_code in [200, 201]:
+        post_data = response.json()
+        print(f"🎉 ¡ÉXITO TOTAL! Entrada publicada en WordPress. Link: {post_data.get('link')}")
         return True
-    except Exception as e:
-        raise Exception(f"ERROR AL ENVIAR CORREO: {e}")
+    else:
+        raise Exception(f"ERROR AL PUBLICAR EN WORDPRESS ({response.status_code}): {response.text}")
 
 if __name__ == "__main__":
     tema = obtener_nuevo_tema_viral()
@@ -251,6 +219,12 @@ if __name__ == "__main__":
 
     print(f"🔥 Tema seleccionado: {tema}")
     titulo, contenido_html = generar_articulo_miri(tema)
-    ruta_imagen = crear_imagen_destacada(titulo)
-    enviar_por_email_a_wordpress(titulo, contenido_html, ruta_imagen)
-    guardar_en_historial(tema)
+    
+    ruta_imagen = crear_imagen_destacada(titulo, tema)
+    media_id, url_imagen_publica = subir_imagen_wordpress(ruta_imagen)
+    
+    if media_id and url_imagen_publica:
+        publicar_articulo_wordpress(titulo, contenido_html, media_id, url_imagen_publica)
+        guardar_en_historial(tema)
+    else:
+        print("❌ Falló la subida de imagen a WordPress.")
