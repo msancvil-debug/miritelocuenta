@@ -40,6 +40,14 @@ HEADERS_BROWSER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 }
 
+# Colección de fotografías HD temáticas para respaldo en Canva
+FOTOS_STOCK_TEMATICAS = [
+    "https://images.unsplash.com/photo-1598899134739-24c46f58b8c0?w=1200&h=630&fit=crop",
+    "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=1200&h=630&fit=crop",
+    "https://images.unsplash.com/photo-1522869635100-9f4c5e86aa37?w=1200&h=630&fit=crop",
+    "https://images.unsplash.com/photo-1611162617213-7d7a39e9b1d7?w=1200&h=630&fit=crop"
+]
+
 def cargar_historial():
     if os.path.exists(HISTORIAL_FILE):
         try:
@@ -160,9 +168,7 @@ def generar_articulo_miri(tema_viral):
     raise Exception("Error crítico: Ningún modelo de Gemini pudo generar el artículo.")
 
 def generar_miniatura_canva_pro(titulo, keyword_foto):
-    """
-    Pide a la API Connect de Canva Pro que inserte el titular y la imagen temática en tu plantilla.
-    """
+    """Pide a la API Connect de Canva Pro que autorrellene tu plantilla."""
     ruta_local = "miniatura_destacada.jpg"
 
     if CANVA_CLIENT_ID and CANVA_CLIENT_SECRET and CANVA_TEMPLATE_ID:
@@ -173,18 +179,22 @@ def generar_miniatura_canva_pro(titulo, keyword_foto):
                 "Authorization": f"Bearer {CANVA_CLIENT_SECRET}",
                 "Content-Type": "application/json"
             }
+            
+            # URL de foto temática libre de derechos para Canva
+            url_foto_fondo = random.choice(FOTOS_STOCK_TEMATICAS)
+            
             payload_canva = {
                 "brand_template_id": CANVA_TEMPLATE_ID,
                 "data": {
                     "TITULAR": {"type": "text", "text": titulo},
-                    "FONDO": {"type": "image", "asset_id": keyword_foto}
+                    "FONDO": {"type": "image", "url": url_foto_fondo}
                 }
             }
             res_canva = requests.post(url_autofill, headers=headers_canva, json=payload_canva, timeout=30)
             if res_canva.status_code in [200, 201]:
                 job_id = res_canva.json().get("job", {}).get("id")
-                # Poll de estado del renderizado
                 url_job = f"[https://api.canva.com/v1/autofills/](https://api.canva.com/v1/autofills/){job_id}"
+                
                 for _ in range(10):
                     time.sleep(3)
                     res_job = requests.get(url_job, headers=headers_canva, timeout=15)
@@ -202,9 +212,9 @@ def generar_miniatura_canva_pro(titulo, keyword_foto):
                         elif status == "failed":
                             break
         except Exception as e:
-            print(f"⚠️ Canva API no respondió a tiempo ({e}). Usando plantilla local...")
+            print(f"⚠️ Canva API no respondió a tiempo ({e}). Usando plantilla local de respaldo...")
 
-    # Generación de respaldo segura si la API de Canva no responde a tiempo
+    # Generación de respaldo segura si no responde la API externa
     img = Image.new("RGB", (1200, 630), (255, 216, 77))
     draw = ImageDraw.Draw(img)
     try:
