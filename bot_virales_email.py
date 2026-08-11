@@ -35,14 +35,13 @@ HEADERS_BROWSER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 }
 
-# Colección de fotografías de stock HD garantizadas (Plató, prensa, televisión, espectáculos)
-FOTOS_UNSPLASH_GARANTIZADAS = [
-    "https://images.unsplash.com/photo-1598899134739-24c46f58b8c0?w=1200&h=630&fit=crop",
-    "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=1200&h=630&fit=crop",
-    "https://images.unsplash.com/photo-1522869635100-9f4c5e86aa37?w=1200&h=630&fit=crop",
-    "https://images.unsplash.com/photo-1492684223066-81342ee5ff30?w=1200&h=630&fit=crop",
-    "https://images.unsplash.com/photo-1514525253161-7a46d19cd819?w=1200&h=630&fit=crop",
-    "https://images.unsplash.com/photo-1516321318423-f06f85e504b3?w=1200&h=630&fit=crop"
+# Colección exclusiva de fotografías HD de temática Televisión, Plató y Prensa Rosa
+FOTOS_PRENSA_TV_CURADAS = [
+    "https://images.unsplash.com/photo-1598899134739-24c46f58b8c0?w=1200&h=630&fit=crop", # Plató de TV / Iluminación
+    "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=1200&h=630&fit=crop", # Micrófono de prensa / escenario
+    "https://images.unsplash.com/photo-1522869635100-9f4c5e86aa37?w=1200&h=630&fit=crop", # Pantalla de televisión / Focos
+    "https://images.unsplash.com/photo-1516321318423-f06f85e504b3?w=1200&h=630&fit=crop", # Focos de estudio / Neón
+    "https://images.unsplash.com/photo-1492684223066-81342ee5ff30?w=1200&h=630&fit=crop"  # Evento / Alfombra roja
 ]
 
 def cargar_historial():
@@ -97,12 +96,17 @@ def obtener_modelos_disponibles():
         pass
     return ["gemini-1.5-flash", "gemini-1.5-pro"]
 
-def extraer_keywords_foto(tema_viral, modelos):
+def extraer_busqueda_foto(tema_viral, modelos):
+    """Pide a Gemini el nombre exacto de la persona o programa para buscar en Wikimedia."""
     prompt = f"""
     Analiza esta noticia: "{tema_viral}"
-    Extrae 1 palabra clave simple en inglés sobre el tema principal o personaje para buscar una foto.
-    Ejemplos: "television", "celebrity", "singer", "money", "studio".
-    Responde ÚNICAMENTE con la palabra clave.
+    Extrae el nombre de la persona famosa principal o del programa de TV del que habla la noticia para buscar su foto.
+    Ejemplos:
+    - Si habla de Nagore Robles -> "Nagore Robles"
+    - Si habla de Allá tú -> "Allá tú"
+    - Si no hay famoso ni programa claro -> "Televisión"
+
+    Responde ÚNICAMENTE con el nombre o término clave.
     """
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     headers = {"Content-Type": "application/json"}
@@ -112,13 +116,13 @@ def extraer_keywords_foto(tema_viral, modelos):
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=15)
             if r.status_code == 200:
-                kw = r.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-                kw_limpia = kw.split(",")[0].strip().replace('"', '').replace("'", "")
-                print(f"🔍 Búsqueda de fotografía de fondo: '{kw_limpia}'")
-                return kw_limpia
+                busqueda = r.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+                busqueda_limpia = busqueda.replace('"', '').replace("'", "")
+                print(f"🔍 Búsqueda de personaje/programa: '{busqueda_limpia}'")
+                return busqueda_limpia
         except Exception:
             continue
-    return "television"
+    return "Televisión"
 
 def generar_articulo_miri(tema_viral):
     modelos = obtener_modelos_disponibles()
@@ -159,8 +163,8 @@ def generar_articulo_miri(tema_viral):
                 articulo = json.loads(raw_text)
                 
                 titulo_limpio = html.unescape(articulo["titulo"]).strip().strip('"').strip("'")
-                keywords_foto = extraer_keywords_foto(tema_viral, modelos)
-                return titulo_limpio, articulo["contenido_html"], keywords_foto
+                busqueda_foto = extraer_busqueda_foto(tema_viral, modelos)
+                return titulo_limpio, articulo["contenido_html"], busqueda_foto
         except Exception:
             continue
 
@@ -182,12 +186,12 @@ def recortar_y_escalar(img, width, height):
     top = (new_height - height) // 2
     return img_resized.crop((left, top, left + width, top + height))
 
-def descargar_foto_fondo(keyword):
-    print(f"🖼️ Buscando fotografía real de stock sobre: '{keyword}'...")
+def descargar_foto_fondo(busqueda):
+    print(f"🖼️ Buscando fotografía en Wikimedia Commons para: '{busqueda}'...")
 
-    # 1. Búsqueda en Wikimedia Commons
+    # 1. Búsqueda con filtro estricto en Wikimedia Commons
     try:
-        url_wiki = f"[https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=](https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=){keyword}&gsrnamespace=6&gsrlimit=5&prop=imageinfo&iiprop=url|mime&format=json"
+        url_wiki = f"[https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=](https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=){busqueda}&gsrnamespace=6&gsrlimit=10&prop=imageinfo&iiprop=url|mime|size&format=json"
         res_wiki = requests.get(url_wiki, headers=HEADERS_BROWSER, timeout=10)
         if res_wiki.status_code == 200:
             pages = res_wiki.json().get("query", {}).get("pages", {})
@@ -196,49 +200,39 @@ def descargar_foto_fondo(keyword):
                 if info:
                     img_url = info[0].get("url", "")
                     mime = info[0].get("mime", "")
-                    if img_url and ("jpeg" in mime or "png" in mime or img_url.lower().endswith(('.jpg', '.jpeg'))):
-                        r_img = requests.get(img_url, headers=HEADERS_BROWSER, timeout=12)
-                        if r_img.status_code == 200 and len(r_img.content) > 10000:
-                            img = Image.open(BytesIO(r_img.content)).convert("RGBA")
-                            print("✅ Fotografía temática obtenida de Wikimedia.")
-                            return recortar_y_escalar(img, 1200, 630)
-    except Exception as e:
-        print(f"⚠️ Wikimedia no devolvió imagen válida: {e}")
+                    w = info[0].get("width", 0)
+                    h = info[0].get("height", 0)
 
-    # 2. Descarga mediante la API v2 de Picsum por ID directo
+                    # FILTRADO ESTRICTO: Solo imágenes JPG/PNG grandes (mínimo 600px) descartando logotipos e iconos
+                    if img_url and ("jpeg" in mime or "png" in mime) and w >= 600 and h >= 400:
+                        # Excluir logotipos o mapas
+                        url_low = img_url.lower()
+                        if not any(bad in url_low for bad in ["logo", "flag", "map", "icon", "diagram"]):
+                            r_img = requests.get(img_url, headers=HEADERS_BROWSER, timeout=12)
+                            if r_img.status_code == 200 and len(r_img.content) > 15000:
+                                img = Image.open(BytesIO(r_img.content)).convert("RGBA")
+                                print(f"✅ Foto real encontrada en Wikimedia Commons sobre '{busqueda}'.")
+                                return recortar_y_escalar(img, 1200, 630)
+    except Exception as e:
+        print(f"⚠️ Búsqueda en Wikimedia sin resultados válidos: {e}")
+
+    # 2. Respaldo garantizado con catálogo exclusivo de Plató de TV / Prensa Rosa
+    print("📸 Seleccionando fotografía temática de Plató de TV / Prensa...")
+    url_foto_tv = random.choice(FOTOS_PRENSA_TV_CURADAS)
     try:
-        res_list = requests.get("[https://picsum.photos/v2/list?page=1&limit=30](https://picsum.photos/v2/list?page=1&limit=30)", headers=HEADERS_BROWSER, timeout=10)
-        if res_list.status_code == 200:
-            fotos = res_list.json()
-            if fotos:
-                foto_item = random.choice(fotos)
-                foto_id = foto_item.get("id")
-                direct_url = f"[https://picsum.photos/id/](https://picsum.photos/id/){foto_id}/1200/630"
-                r_direct = requests.get(direct_url, headers=HEADERS_BROWSER, timeout=12)
-                if r_direct.status_code == 200 and len(r_direct.content) > 10000:
-                    img = Image.open(BytesIO(r_direct.content)).convert("RGBA")
-                    print("✅ Fotografía real obtenida desde la CDN de Picsum.")
-                    return img
-    except Exception as e:
-        print(f"⚠️ Picsum v2 falló: {e}")
-
-    # 3. Respaldo definitivo con fotografías HD directas de Unsplash (Imposible que falle)
-    print("📸 Descargando fotografía desde catálogo HD de respaldo...")
-    for url_unsplash in random.sample(FOTOS_UNSPLASH_GARANTIZADAS, len(FOTOS_UNSPLASH_GARANTIZADAS)):
-        try:
-            r_u = requests.get(url_unsplash, headers=HEADERS_BROWSER, timeout=12)
-            if r_u.status_code == 200 and len(r_u.content) > 10000:
-                img = Image.open(BytesIO(r_u.content)).convert("RGBA")
-                print("✅ Fotografía descargada con éxito desde Unsplash CDN.")
-                return img
-        except Exception:
-            continue
+        r_tv = requests.get(url_foto_tv, headers=HEADERS_BROWSER, timeout=12)
+        if r_tv.status_code == 200 and len(r_tv.content) > 10000:
+            img = Image.open(BytesIO(r_tv.content)).convert("RGBA")
+            print("✅ Fotografía temática de estudio/prensa cargada con éxito.")
+            return img
+    except Exception:
+        pass
 
     return Image.new("RGBA", (1200, 630), (40, 20, 60, 255))
 
-def crear_imagen_destacada(titulo, keywords_foto):
+def crear_imagen_destacada(titulo, busqueda_foto):
     width, height = 1200, 630
-    bg_img = descargar_foto_fondo(keywords_foto)
+    bg_img = descargar_foto_fondo(busqueda_foto)
 
     img = bg_img.copy()
     draw = ImageDraw.Draw(img)
@@ -257,7 +251,7 @@ def crear_imagen_destacada(titulo, keywords_foto):
     draw.rectangle([badge_x1, badge_y1, badge_x2, badge_y2], fill=(240, 68, 56, 255), outline=(22, 22, 22, 255), width=3)
     draw.text((badge_x1 + 15, badge_y1 + 10), "MIRI TE LO CUENTA", fill=(255, 255, 255, 255), font=font_badge)
 
-    # 2. FALDÓN AMARILLO EN LA PARTE INFERIOR (El 65% superior queda 100% visible)
+    # 2. FALDÓN AMARILLO INFERIOR
     box_x1, box_y1 = 40, 420
     box_x2, box_y2 = width - 40, height - 30
 
@@ -270,7 +264,7 @@ def crear_imagen_destacada(titulo, keywords_foto):
 
     img_filename = "miniatura_destacada.jpg"
     img.convert("RGB").save(img_filename, "JPEG", quality=92)
-    print("✅ Portada ensamblada correctamente.")
+    print("✅ Portada de calidad ensamblada correctamente.")
     return img_filename
 
 def publicar_en_wordpress(titulo, contenido_html, ruta_imagen):
@@ -346,8 +340,8 @@ if __name__ == "__main__":
         tema = "Tendencias y polémica viral de la semana en redes sociales"
 
     print(f"🔥 Tema seleccionado: {tema}")
-    titulo, contenido_html, keywords_foto = generar_articulo_miri(tema)
-    ruta_imagen = crear_imagen_destacada(titulo, keywords_foto)
+    titulo, contenido_html, busqueda_foto = generar_articulo_miri(tema)
+    ruta_imagen = crear_imagen_destacada(titulo, busqueda_foto)
 
     if titulo and contenido_html and ruta_imagen:
         publicado = publicar_en_wordpress(titulo, contenido_html, ruta_imagen)
