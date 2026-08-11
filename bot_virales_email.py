@@ -32,12 +32,6 @@ HEADERS_BROWSER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-MODELOS_RESERVA = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash"
-]
-
 def cargar_historial():
     if os.path.exists(HISTORIAL_FILE):
         try:
@@ -72,6 +66,29 @@ def obtener_nuevo_tema_viral():
             print(f"⚠️ Error leyendo feed {feed_url}: {e}")
     return None
 
+def obtener_modelos_disponibles():
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
+    modelos = []
+    try:
+        print("🔍 Consultando a Google la lista de modelos activos para tu API Key...")
+        res = requests.get(url, timeout=15)
+        if res.status_code == 200:
+            data = res.json()
+            for m in data.get("models", []):
+                methods = m.get("supportedGenerationMethods", [])
+                if "generateContent" in methods:
+                    name = m["name"].replace("models/", "")
+                    modelos.append(name)
+            print(f"📋 Modelos compatibles encontrados: {modelos}")
+        else:
+            print(f"⚠️ Error al listar modelos (Código {res.status_code}): {res.text}")
+    except Exception as e:
+        print(f"⚠️ Excepción al consultar modelos disponibles: {e}")
+
+    if not modelos:
+        modelos = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash"]
+    return modelos
+
 def generar_articulo_miri(tema_viral):
     prompt = f"""
     Eres la redactora principal del proyecto "Miri te lo cuenta", un portal sobre tendencias de internet, vídeos virales, reality shows y cultura pop en redes sociales (TikTok, X, Instagram, YouTube).
@@ -97,44 +114,18 @@ def generar_articulo_miri(tema_viral):
     }}
     """
 
-    # 1. Intentar generación con el SDK oficial de Google GenAI
-    try:
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        for modelo in MODELOS_RESERVA:
-            print(f"🤖 Intentando generación con SDK de Gemini ({modelo})...")
-            try:
-                response = client.models.generate_content(
-                    model=modelo,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json"
-                    )
-                )
-                raw_text = response.text.strip()
-                if raw_text.startswith("```"):
-                    raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-                articulo = json.loads(raw_text)
-                print(f"✅ ¡Éxito con el SDK de Gemini ({modelo})!")
-                return articulo["titulo"], articulo["contenido_html"]
-            except Exception as e:
-                print(f"⚠️ Error con SDK en {modelo}: {e}")
-    except ImportError:
-        print("ℹ️ SDK google-genai no disponible, pasando a petición REST...")
-
-    # 2. Respaldo por HTTP REST directo si el SDK no estuviera disponible
     headers = {"Content-Type": "application/json"}
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"response_mime_type": "application/json"}
     }
 
+    modelos = obtener_modelos_disponibles()
     ultimo_error = ""
-    for modelo in MODELOS_RESERVA:
-        url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){modelo}:generateContent?key={GEMINI_API_KEY}"
-        print(f"🤖 Probando HTTP REST directo con modelo: {modelo}...")
+
+    for modelo in modelos:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={GEMINI_API_KEY}"
+        print(f"🤖 Probando generación con modelo: {modelo}...")
 
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=40)
@@ -144,14 +135,14 @@ def generar_articulo_miri(tema_viral):
                 if raw_text.startswith("```"):
                     raw_text = raw_text.replace("```json", "").replace("```", "").strip()
                 articulo = json.loads(raw_text)
-                print(f"✅ ¡Éxito vía HTTP REST con {modelo}!")
+                print(f"✅ ¡Éxito total! Artículo generado con el modelo {modelo}.")
                 return articulo["titulo"], articulo["contenido_html"]
             else:
                 ultimo_error = f"Código {response.status_code}: {response.text}"
-                print(f"⚠️ {modelo} devolvió {response.status_code}. Probando siguiente...")
+                print(f"⚠️ {modelo} devolvió {response.status_code}. Probando siguiente modelo...")
         except Exception as e:
             ultimo_error = str(e)
-            print(f"⚠️ Excepción HTTP con {modelo}: {e}")
+            print(f"⚠️ Excepción con {modelo}: {e}")
 
     raise Exception(f"ERROR CRÍTICO: Ningún modelo pudo generar el artículo. Último error: {ultimo_error}")
 
@@ -173,7 +164,7 @@ def enviar_por_email_a_wordpress(titulo, contenido_html):
         server.login(GMAIL_USER, GMAIL_APP_PASS)
         server.send_message(msg)
         server.quit()
-        print("🎉 EXITO TOTAL: El correo fue enviado desde Gmail a WordPress.")
+        print("🎉 ÉXITO TOTAL: El correo fue enviado desde Gmail a WordPress.")
         return True
     except Exception as e:
         raise Exception(f"ERROR CRÍTICO AL ENVIAR CORREO DESDE GMAIL: {e}")
