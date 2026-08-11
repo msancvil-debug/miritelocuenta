@@ -4,6 +4,7 @@ import os
 import time
 import textwrap
 import html
+import random
 import xml.etree.ElementTree as ET
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
@@ -33,6 +34,16 @@ FEEDS_TENDENCIAS = [
 HEADERS_BROWSER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 }
+
+# Colección de fotografías de stock HD garantizadas (Plató, prensa, televisión, espectáculos)
+FOTOS_UNSPLASH_GARANTIZADAS = [
+    "https://images.unsplash.com/photo-1598899134739-24c46f58b8c0?w=1200&h=630&fit=crop",
+    "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=1200&h=630&fit=crop",
+    "https://images.unsplash.com/photo-1522869635100-9f4c5e86aa37?w=1200&h=630&fit=crop",
+    "https://images.unsplash.com/photo-1492684223066-81342ee5ff30?w=1200&h=630&fit=crop",
+    "https://images.unsplash.com/photo-1514525253161-7a46d19cd819?w=1200&h=630&fit=crop",
+    "https://images.unsplash.com/photo-1516321318423-f06f85e504b3?w=1200&h=630&fit=crop"
+]
 
 def cargar_historial():
     if os.path.exists(HISTORIAL_FILE):
@@ -68,7 +79,6 @@ def obtener_nuevo_tema_viral():
     return None
 
 def obtener_modelos_disponibles():
-    """Consulta dinámicamente qué modelos de Gemini están activos."""
     url_list = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
     try:
         res = requests.get(url_list, timeout=10)
@@ -103,7 +113,7 @@ def extraer_keywords_foto(tema_viral, modelos):
             r = requests.post(url, headers=headers, json=payload, timeout=15)
             if r.status_code == 200:
                 kw = r.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-                kw_limpia = kw.split(",")[0].strip()
+                kw_limpia = kw.split(",")[0].strip().replace('"', '').replace("'", "")
                 print(f"🔍 Búsqueda de fotografía de fondo: '{kw_limpia}'")
                 return kw_limpia
         except Exception:
@@ -173,9 +183,9 @@ def recortar_y_escalar(img, width, height):
     return img_resized.crop((left, top, left + width, top + height))
 
 def descargar_foto_fondo(keyword):
-    print(f"🖼️ Descargando fotografía real de stock sobre: '{keyword}'...")
+    print(f"🖼️ Buscando fotografía real de stock sobre: '{keyword}'...")
 
-    # Búsqueda en Wikimedia Commons
+    # 1. Búsqueda en Wikimedia Commons
     try:
         url_wiki = f"[https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=](https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=){keyword}&gsrnamespace=6&gsrlimit=5&prop=imageinfo&iiprop=url|mime&format=json"
         res_wiki = requests.get(url_wiki, headers=HEADERS_BROWSER, timeout=10)
@@ -193,25 +203,43 @@ def descargar_foto_fondo(keyword):
                             print("✅ Fotografía temática obtenida de Wikimedia.")
                             return recortar_y_escalar(img, 1200, 630)
     except Exception as e:
-        print(f"⚠️ Wikimedia falló: {e}")
+        print(f"⚠️ Wikimedia no devolvió imagen válida: {e}")
 
-    # Backup con Picsum (Fotografía real garantizada)
+    # 2. Descarga mediante la API v2 de Picsum por ID directo
     try:
-        res_picsum = requests.get("[https://picsum.photos/1200/630](https://picsum.photos/1200/630)", headers=HEADERS_BROWSER, timeout=12, allow_redirects=True)
-        if res_picsum.status_code == 200 and len(res_picsum.content) > 10000:
-            img = Image.open(BytesIO(res_picsum.content)).convert("RGBA")
-            print("✅ Fotografía descargada de Picsum.")
-            return img
-    except Exception:
-        pass
+        res_list = requests.get("[https://picsum.photos/v2/list?page=1&limit=30](https://picsum.photos/v2/list?page=1&limit=30)", headers=HEADERS_BROWSER, timeout=10)
+        if res_list.status_code == 200:
+            fotos = res_list.json()
+            if fotos:
+                foto_item = random.choice(fotos)
+                foto_id = foto_item.get("id")
+                direct_url = f"[https://picsum.photos/id/](https://picsum.photos/id/){foto_id}/1200/630"
+                r_direct = requests.get(direct_url, headers=HEADERS_BROWSER, timeout=12)
+                if r_direct.status_code == 200 and len(r_direct.content) > 10000:
+                    img = Image.open(BytesIO(r_direct.content)).convert("RGBA")
+                    print("✅ Fotografía real obtenida desde la CDN de Picsum.")
+                    return img
+    except Exception as e:
+        print(f"⚠️ Picsum v2 falló: {e}")
 
-    return Image.new("RGBA", (1200, 630), (220, 220, 225, 255))
+    # 3. Respaldo definitivo con fotografías HD directas de Unsplash (Imposible que falle)
+    print("📸 Descargando fotografía desde catálogo HD de respaldo...")
+    for url_unsplash in random.sample(FOTOS_UNSPLASH_GARANTIZADAS, len(FOTOS_UNSPLASH_GARANTIZADAS)):
+        try:
+            r_u = requests.get(url_unsplash, headers=HEADERS_BROWSER, timeout=12)
+            if r_u.status_code == 200 and len(r_u.content) > 10000:
+                img = Image.open(BytesIO(r_u.content)).convert("RGBA")
+                print("✅ Fotografía descargada con éxito desde Unsplash CDN.")
+                return img
+        except Exception:
+            continue
+
+    return Image.new("RGBA", (1200, 630), (40, 20, 60, 255))
 
 def crear_imagen_destacada(titulo, keywords_foto):
     width, height = 1200, 630
     bg_img = descargar_foto_fondo(keywords_foto)
 
-    # La foto ocupa el 100% de la pantalla sin capas oscuras gigantes
     img = bg_img.copy()
     draw = ImageDraw.Draw(img)
 
@@ -222,34 +250,30 @@ def crear_imagen_destacada(titulo, keywords_foto):
         font_badge = ImageFont.load_default()
         font_title = ImageFont.load_default()
 
-    # 1. LOGO / PLACA SUPERIOR IZQUIERDA (Pequeño distintivo)
+    # 1. PLACA SUPERIOR IZQUIERDA ("MIRI TE LO CUENTA")
     badge_x1, badge_y1 = 40, 30
     badge_x2, badge_y2 = 360, 75
     draw.rectangle([badge_x1 + 4, badge_y1 + 4, badge_x2 + 4, badge_y2 + 4], fill=(22, 22, 22, 255))
     draw.rectangle([badge_x1, badge_y1, badge_x2, badge_y2], fill=(240, 68, 56, 255), outline=(22, 22, 22, 255), width=3)
     draw.text((badge_x1 + 15, badge_y1 + 10), "MIRI TE LO CUENTA", fill=(255, 255, 255, 255), font=font_badge)
 
-    # 2. FALDÓN AMARILLO COMPACTO EN LA PARTE INFERIOR
-    # Dejamos desde y=0 hasta y=420 (65% SUPERIOR) TOTALMENTE LIBRE para ver la foto
+    # 2. FALDÓN AMARILLO EN LA PARTE INFERIOR (El 65% superior queda 100% visible)
     box_x1, box_y1 = 40, 420
-    box_x2, box_y2 = width - 40, height - 30  # De y=420 a y=600
+    box_x2, box_y2 = width - 40, height - 30
 
-    # Sombra negra y caja amarilla
     draw.rectangle([box_x1 + 6, box_y1 + 6, box_x2 + 6, box_y2 + 6], fill=(22, 22, 22, 255))
     draw.rectangle([box_x1, box_y1, box_x2, box_y2], fill=(255, 216, 77, 255), outline=(22, 22, 22, 255), width=4)
 
-    # Texto en el faldón inferior
     lineas = textwrap.wrap(titulo, width=42)
     texto_formateado = "\n".join(lineas[:3])
     draw.multiline_text((box_x1 + 25, box_y1 + 20), texto_formateado, fill=(22, 22, 22, 255), font=font_title, spacing=8)
 
     img_filename = "miniatura_destacada.jpg"
     img.convert("RGB").save(img_filename, "JPEG", quality=92)
-    print("✅ Portada ensamblada con la foto de fondo 100% visible.")
+    print("✅ Portada ensamblada correctamente.")
     return img_filename
 
 def publicar_en_wordpress(titulo, contenido_html, ruta_imagen):
-    # Publicación por API REST (Si existen credenciales)
     if WP_URL and WP_USER and WP_APP_PASS:
         try:
             print("🚀 Publicando vía API REST...")
@@ -289,7 +313,6 @@ def publicar_en_wordpress(titulo, contenido_html, ruta_imagen):
         except Exception as e:
             print(f"⚠️ API REST falló: {e}")
 
-    # Publicación por Email Secreto
     if GMAIL_USER and GMAIL_APP_PASS and WP_SECRET_EMAIL:
         print("📧 Publicando vía correo secreto...")
         msg = MIMEMultipart()
