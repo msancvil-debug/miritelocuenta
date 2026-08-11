@@ -36,14 +36,6 @@ HEADERS_BROWSER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 }
 
-# Imágenes de respaldo 100% luminosas y de estudio de TV
-FOTOS_LUMINOSAS_RESPALDO = [
-    "https://images.unsplash.com/photo-1598899134739-24c46f58b8c0?w=1200&h=630&fit=crop", # Plató con luces brillantes
-    "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=1200&h=630&fit=crop", # Estudio / Micrófono iluminado
-    "https://images.unsplash.com/photo-1522869635100-9f4c5e86aa37?w=1200&h=630&fit=crop", # Luces de plató luminosas
-    "https://images.unsplash.com/photo-1514525253161-7a46d19cd819?w=1200&h=630&fit=crop"  # Escenario de luces brillantes
-]
-
 def cargar_historial():
     if os.path.exists(HISTORIAL_FILE):
         try:
@@ -97,13 +89,22 @@ def obtener_modelos_disponibles():
     return ["gemini-1.5-flash", "gemini-1.5-pro"]
 
 def generar_prompt_imagen_ai(tema_viral, modelos):
+    """
+    Analiza la noticia y extrae los elementos visuales concretos (logos de TikTok, Meta,
+    pantallas de móvil, mapas, personajes, etc.) para que la imagen represente FIELMENTE el tema.
+    """
     prompt = f"""
-    Lee esta noticia: "{tema_viral}"
-    Crea una descripción visual corta en inglés (máximo 12 palabras) para generar una imagen de fondo brillante, clara y muy iluminada de estilo prensa/TV.
-    Ejemplos:
-    - "brightly lit television game show studio set with vivid colors, HD photo"
-    - "bright broadcast television studio interview set with studio lights, HD photo"
-    - "bright entertainment news studio background with colorful lights, HD photo"
+    Lee atentamente esta noticia: "{tema_viral}"
+    Crea una descripción visual en inglés (máximo 15 palabras) que represente LOS ELEMENTOS EXACTOS de la noticia.
+    REGLAS:
+    - Si habla de aplicaciones (TikTok, Meta, Instagram, WhatsApp): incluye sus nombres y logos o pantallas de smartphone.
+    - Si habla de una ciudad/país/lugar (Ceuta, España, Madrid): menciona mapas, símbolos o ubicación digital.
+    - Si habla de famosos o personajes: describe a la persona en un entorno editorial moderno.
+    - Estilo siempre: "bright high resolution editorial digital illustration, vivid colors, HD photo"
+
+    EJEMPLOS:
+    - Para TikTok/Meta/Ceuta -> "TikTok and Meta social media icons on smartphone screen with digital news background, vivid HD"
+    - Para Televisión/Reality -> "vibrant television studio stage with glowing lights, HD news photo"
 
     Responde ÚNICAMENTE con la frase en inglés.
     """
@@ -117,11 +118,11 @@ def generar_prompt_imagen_ai(tema_viral, modelos):
             if r.status_code == 200:
                 p_text = r.json()['candidates'][0]['content']['parts'][0]['text'].strip()
                 p_limpio = p_text.replace('"', '').replace("'", "")
-                print(f"🎨 Prompt de IA generado para la imagen: '{p_limpio}'")
+                print(f"🎨 Prompt hiper-específico generado por la IA: '{p_limpio}'")
                 return p_limpio
         except Exception:
             continue
-    return "brightly lit television broadcast studio set with vivid colors, HD photo"
+    return "social media applications and mobile phone news alert, bright vivid HD illustration"
 
 def generar_articulo_miri(tema_viral):
     modelos = obtener_modelos_disponibles()
@@ -170,47 +171,36 @@ def generar_articulo_miri(tema_viral):
     raise Exception("Error crítico: Ningún modelo de Gemini pudo generar el artículo.")
 
 def crear_fondo_luminoso_marca(width, height):
-    """Crea un fondo gráfico claro, vibrante y luminoso con la estética de Miri."""
-    img = Image.new("RGBA", (width, height), (255, 247, 239, 255)) # Marfil brillante
+    """Fondo limpio y corporativo de Miri (sin fotos raras de stock)."""
+    img = Image.new("RGBA", (width, height), (255, 247, 239, 255))
     draw = ImageDraw.Draw(img)
 
-    # Franjas decorativas luminosas
-    draw.rectangle([0, 0, width, 15], fill=(240, 68, 56, 255)) # Rojo Coral
-    draw.rectangle([0, 15, width, 25], fill=(255, 216, 77, 255)) # Amarillo
+    draw.rectangle([0, 0, width, 15], fill=(240, 68, 56, 255))
+    draw.rectangle([0, 15, width, 25], fill=(255, 216, 77, 255))
     draw.rectangle([0, height - 15, width, height], fill=(22, 22, 22, 255))
 
     return img
 
 def descargar_foto_ia(prompt_ingles):
-    """Intenta generar/descargar una fotografía clara. Si falla, activa el fondo luminoso de marca."""
-    print(f"🖼️ Generando fotografía luminosa con IA basada en: '{prompt_ingles}'...")
+    """Genera la imagen conceptual exacta del tema usando motor turbo ultrarrápido."""
+    print(f"🖼️ Generando imagen temática específica por IA: '{prompt_ingles}'...")
     
     prompt_encoded = urllib.parse.quote(prompt_ingles)
     seed_azar = random.randint(100, 99999)
-    url_pollinations = f"[https://image.pollinations.ai/prompt/](https://image.pollinations.ai/prompt/){prompt_encoded}?width=1200&height=630&seed={seed_azar}&nologo=true&model=flux"
+    # Usamos model=turbo para generación ultra rápida que no caduca en GitHub Actions
+    url_pollinations = f"[https://image.pollinations.ai/prompt/](https://image.pollinations.ai/prompt/){prompt_encoded}?width=1200&height=630&seed={seed_azar}&nologo=true&model=turbo"
 
     try:
         res = requests.get(url_pollinations, headers=HEADERS_BROWSER, timeout=20)
-        if res.status_code == 200 and len(res.content) > 15000:
+        if res.status_code == 200 and len(res.content) > 12000:
             img = Image.open(BytesIO(res.content)).convert("RGBA")
-            print("✅ Fotografía temática generada con éxito por la IA.")
+            print("✅ Imagen temática generada con éxito por la IA.")
             return img
     except Exception as e:
-        print(f"⚠️ Pollinations no respondió a tiempo: {e}. Probando fotos de estudio iluminadas...")
+        print(f"⚠️ Generación directa de IA tardó demasiado: {e}.")
 
-    # Respaldo 1: Unsplash estudio brillante
-    for url_res in FOTOS_LUMINOSAS_RESPALDO:
-        try:
-            r_u = requests.get(url_res, headers=HEADERS_BROWSER, timeout=10)
-            if r_u.status_code == 200 and len(r_u.content) > 10000:
-                img = Image.open(BytesIO(r_u.content)).convert("RGBA")
-                print("✅ Fotografía de plató iluminado cargada con éxito.")
-                return img
-        except Exception:
-            continue
-
-    # Respaldo 2: Fondo brillante de marca (Garantizado NUNCA oscuro)
-    print("✨ Activando fondo gráfico claro de marca Miri...")
+    # Si la API no responde, usa el lienzo de marca limpio (NUNCA fotos de escaletas o cámaras)
+    print("✨ Utilizando plantilla gráfica limpia de marca...")
     return crear_fondo_luminoso_marca(1200, 630)
 
 def crear_imagen_destacada(titulo, prompt_foto):
@@ -234,7 +224,7 @@ def crear_imagen_destacada(titulo, prompt_foto):
     draw.rectangle([badge_x1, badge_y1, badge_x2, badge_y2], fill=(240, 68, 56, 255), outline=(22, 22, 22, 255), width=3)
     draw.text((badge_x1 + 15, badge_y1 + 10), "MIRI TE LO CUENTA", fill=(255, 255, 255, 255), font=font_badge)
 
-    # 2. FALDÓN AMARILLO INFERIOR CON BORDE NEGRO
+    # 2. FALDÓN AMARILLO INFERIOR
     box_x1, box_y1 = 40, 420
     box_x2, box_y2 = width - 40, height - 30
 
@@ -247,7 +237,7 @@ def crear_imagen_destacada(titulo, prompt_foto):
 
     img_filename = "miniatura_destacada.jpg"
     img.convert("RGB").save(img_filename, "JPEG", quality=92)
-    print("✅ Portada ensamblada correctamente.")
+    print("✅ Portada de noticia ensamblada correctamente.")
     return img_filename
 
 def publicar_en_wordpress(titulo, contenido_html, ruta_imagen):
