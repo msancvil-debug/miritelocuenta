@@ -18,7 +18,7 @@ WP_URL = (os.environ.get("WP_URL") or "").strip().rstrip("/")
 WP_USER = (os.environ.get("WP_USER") or "").strip()
 WP_APP_PASS = (os.environ.get("WP_APP_PASS") or "").strip().replace(" ", "")
 
-# Credenciales de Email (WordPress Post-by-Email)
+# Credenciales de Email
 GMAIL_USER = (os.environ.get("GMAIL_USER") or "").strip()
 GMAIL_APP_PASS = (os.environ.get("GMAIL_APP_PASS") or "").strip()
 WP_SECRET_EMAIL = (os.environ.get("WP_SECRET_EMAIL") or "").strip()
@@ -31,8 +31,7 @@ FEEDS_TENDENCIAS = [
 ]
 
 HEADERS_BROWSER = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 }
 
 def cargar_historial():
@@ -89,17 +88,11 @@ def obtener_modelos_disponibles():
     return ["gemini-1.5-flash", "gemini-1.5-pro"]
 
 def extraer_keywords_foto(tema_viral, modelos):
-    """Pide a Gemini 2-3 palabras clave en inglés sobre la temática o personaje."""
     prompt = f"""
     Analiza esta noticia: "{tema_viral}"
-    Extrae de 1 a 2 palabras clave en inglés simples (nombre del personaje, lugar o tema) para buscar una foto representativa.
-    Ejemplos:
-    - Si habla de Nagore Robles -> "television"
-    - Si habla de un cantante -> "singer"
-    - Si habla de facturas -> "money"
-    - Si habla de un programa de TV -> "studio"
-
-    Responde ÚNICAMENTE con las palabras clave en inglés.
+    Extrae 1 palabra clave simple en inglés sobre el tema principal o personaje para buscar una foto.
+    Ejemplos: "television", "celebrity", "singer", "money", "studio".
+    Responde ÚNICAMENTE con la palabra clave.
     """
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     headers = {"Content-Type": "application/json"}
@@ -110,9 +103,9 @@ def extraer_keywords_foto(tema_viral, modelos):
             r = requests.post(url, headers=headers, json=payload, timeout=15)
             if r.status_code == 200:
                 kw = r.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-                kw_limpias = kw.split(",")[0].strip()
-                print(f"🔍 Palabra clave para la fotografía de fondo: '{kw_limpias}'")
-                return kw_limpias
+                kw_limpia = kw.split(",")[0].strip()
+                print(f"🔍 Búsqueda de fotografía de fondo: '{kw_limpia}'")
+                return kw_limpia
         except Exception:
             continue
     return "television"
@@ -122,15 +115,15 @@ def generar_articulo_miri(tema_viral):
     
     prompt = f"""
     Eres la redactora principal del portal "Miri te lo cuenta".
-    Escribe un artículo ameno, cotilla, fresco y bien redactado sobre la siguiente tendencia:
+    Escribe un artículo ameno, cotilla, fresco e impecable sobre la siguiente tendencia:
     "{tema_viral}"
 
     REQUISITOS DEL TÍTULO:
-    - Debe ser impecable ortográficamente, sin faltas ni caracteres extraños.
-    - Atractivo y directo para captar la atención en redes sociales.
+    - Sin comillas raras ni entidades HTML.
+    - Atractivo y directo para redes sociales.
 
     REQUISITOS DEL CONTENIDO:
-    - Redacción en español, cercano y estructurado con etiquetas HTML (<p>, <h2>, <h3>, <strong>).
+    - Redacción en español con etiquetas HTML (<p>, <h2>, <h3>, <strong>).
 
     Responde ÚNICAMENTE con este JSON válido:
     {{
@@ -164,7 +157,6 @@ def generar_articulo_miri(tema_viral):
     raise Exception("Error crítico: Ningún modelo de Gemini pudo generar el artículo.")
 
 def recortar_y_escalar(img, width, height):
-    """Escala y realiza un recorte central para encajar perfectamente en 1200x630."""
     target_ratio = width / height
     img_ratio = img.width / img.height
 
@@ -181,10 +173,9 @@ def recortar_y_escalar(img, width, height):
     return img_resized.crop((left, top, left + width, top + height))
 
 def descargar_foto_fondo(keyword):
-    """Busca y descarga una fotografía real de alta calidad que no falle en GitHub."""
-    print(f"🖼️ Buscando fotografía temática en la red sobre: '{keyword}'...")
+    print(f"🖼️ Descargando fotografía real de stock sobre: '{keyword}'...")
 
-    # 1. Búsqueda directa en Wikimedia Commons (Imágenes de libre uso)
+    # Búsqueda en Wikimedia Commons
     try:
         url_wiki = f"[https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=](https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=){keyword}&gsrnamespace=6&gsrlimit=5&prop=imageinfo&iiprop=url|mime&format=json"
         res_wiki = requests.get(url_wiki, headers=HEADERS_BROWSER, timeout=10)
@@ -199,71 +190,69 @@ def descargar_foto_fondo(keyword):
                         r_img = requests.get(img_url, headers=HEADERS_BROWSER, timeout=12)
                         if r_img.status_code == 200 and len(r_img.content) > 10000:
                             img = Image.open(BytesIO(r_img.content)).convert("RGBA")
-                            print("✅ Fotografía temática encontrada con éxito en Wikimedia.")
+                            print("✅ Fotografía temática obtenida de Wikimedia.")
                             return recortar_y_escalar(img, 1200, 630)
     except Exception as e:
         print(f"⚠️ Wikimedia falló: {e}")
 
-    # 2. Descarga desde banco de fotografía libre garantizado (Picsum Photos)
+    # Backup con Picsum (Fotografía real garantizada)
     try:
-        print("📸 Descargando fotografía temática desde banco de fotos de respaldo...")
-        res_picsum = requests.get("[https://picsum.photos/1200/630](https://picsum.photos/1200/630)", headers=HEADERS_BROWSER, timeout=15, allow_redirects=True)
+        res_picsum = requests.get("[https://picsum.photos/1200/630](https://picsum.photos/1200/630)", headers=HEADERS_BROWSER, timeout=12, allow_redirects=True)
         if res_picsum.status_code == 200 and len(res_picsum.content) > 10000:
             img = Image.open(BytesIO(res_picsum.content)).convert("RGBA")
-            print("✅ Fotografía descargada con éxito desde Picsum.")
+            print("✅ Fotografía descargada de Picsum.")
             return img
-    except Exception as e:
-        print(f"⚠️ Error descargando foto de respaldo: {e}")
+    except Exception:
+        pass
 
-    # 3. Respaldo visual estudio si no hay conexión
-    return Image.new("RGBA", (1200, 630), (50, 40, 70, 255))
+    return Image.new("RGBA", (1200, 630), (220, 220, 225, 255))
 
 def crear_imagen_destacada(titulo, keywords_foto):
     width, height = 1200, 630
     bg_img = descargar_foto_fondo(keywords_foto)
 
-    # Filtro oscuro suave (35% opacidad) para resaltar el texto sin tapar la foto
-    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 90))
-    img = Image.alpha_composite(bg_img, overlay)
+    # La foto ocupa el 100% de la pantalla sin capas oscuras gigantes
+    img = bg_img.copy()
     draw = ImageDraw.Draw(img)
-
-    margin = 50
-    box_x1, box_y1 = margin, 120
-    box_x2, box_y2 = width - margin, height - 80
-
-    # Sombra negra y caja amarilla principal
-    draw.rectangle([box_x1 + 8, box_y1 + 8, box_x2 + 8, box_y2 + 8], fill=(22, 22, 22, 255))
-    draw.rectangle([box_x1, box_y1, box_x2, box_y2], fill=(255, 216, 77, 255), outline=(22, 22, 22, 255), width=5)
-
-    # Placa distintiva "MIRI TE LO CUENTA"
-    badge_x1, badge_y1 = margin + 20, 50
-    badge_x2, badge_y2 = margin + 380, 100
-    draw.rectangle([badge_x1 + 4, badge_y1 + 4, badge_x2 + 4, badge_y2 + 4], fill=(22, 22, 22, 255))
-    draw.rectangle([badge_x1, badge_y1, badge_x2, badge_y2], fill=(240, 68, 56, 255), outline=(22, 22, 22, 255), width=3)
 
     try:
         font_badge = ImageFont.truetype("DejaVuSans-Bold.ttf", 20)
-        font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 34)
+        font_title = ImageFont.truetype("DejaVuSans-Bold.ttf", 30)
     except Exception:
         font_badge = ImageFont.load_default()
         font_title = ImageFont.load_default()
 
-    draw.text((badge_x1 + 15, badge_y1 + 12), "MIRI TE LO CUENTA", fill=(255, 255, 255, 255), font=font_badge)
+    # 1. LOGO / PLACA SUPERIOR IZQUIERDA (Pequeño distintivo)
+    badge_x1, badge_y1 = 40, 30
+    badge_x2, badge_y2 = 360, 75
+    draw.rectangle([badge_x1 + 4, badge_y1 + 4, badge_x2 + 4, badge_y2 + 4], fill=(22, 22, 22, 255))
+    draw.rectangle([badge_x1, badge_y1, badge_x2, badge_y2], fill=(240, 68, 56, 255), outline=(22, 22, 22, 255), width=3)
+    draw.text((badge_x1 + 15, badge_y1 + 10), "MIRI TE LO CUENTA", fill=(255, 255, 255, 255), font=font_badge)
 
-    lineas = textwrap.wrap(titulo, width=38)
-    texto_formateado = "\n".join(lineas[:4])
-    draw.multiline_text((box_x1 + 30, box_y1 + 35), texto_formateado, fill=(22, 22, 22, 255), font=font_title, spacing=12)
+    # 2. FALDÓN AMARILLO COMPACTO EN LA PARTE INFERIOR
+    # Dejamos desde y=0 hasta y=420 (65% SUPERIOR) TOTALMENTE LIBRE para ver la foto
+    box_x1, box_y1 = 40, 420
+    box_x2, box_y2 = width - 40, height - 30  # De y=420 a y=600
+
+    # Sombra negra y caja amarilla
+    draw.rectangle([box_x1 + 6, box_y1 + 6, box_x2 + 6, box_y2 + 6], fill=(22, 22, 22, 255))
+    draw.rectangle([box_x1, box_y1, box_x2, box_y2], fill=(255, 216, 77, 255), outline=(22, 22, 22, 255), width=4)
+
+    # Texto en el faldón inferior
+    lineas = textwrap.wrap(titulo, width=42)
+    texto_formateado = "\n".join(lineas[:3])
+    draw.multiline_text((box_x1 + 25, box_y1 + 20), texto_formateado, fill=(22, 22, 22, 255), font=font_title, spacing=8)
 
     img_filename = "miniatura_destacada.jpg"
     img.convert("RGB").save(img_filename, "JPEG", quality=92)
-    print("✅ Portada gráfica ensamblada correctamente.")
+    print("✅ Portada ensamblada con la foto de fondo 100% visible.")
     return img_filename
 
 def publicar_en_wordpress(titulo, contenido_html, ruta_imagen):
-    # Opción REST
+    # Publicación por API REST (Si existen credenciales)
     if WP_URL and WP_USER and WP_APP_PASS:
         try:
-            print("🚀 Publicando vía API REST de WordPress...")
+            print("🚀 Publicando vía API REST...")
             url_media = f"{WP_URL}/wp-json/wp/v2/media"
             with open(ruta_imagen, "rb") as f:
                 media_bytes = f.read()
@@ -295,14 +284,14 @@ def publicar_en_wordpress(titulo, contenido_html, ruta_imagen):
 
             r_post = requests.post(url_posts, json=payload, headers={"Content-Type": "application/json"}, auth=(WP_USER, WP_APP_PASS), timeout=30)
             if r_post.status_code in [200, 201]:
-                print("🎉 ¡Publicado con éxito en WordPress vía API REST!")
+                print("🎉 Publicado con éxito vía API REST.")
                 return True
         except Exception as e:
-            print(f"⚠️ Falló la publicación por API REST: {e}")
+            print(f"⚠️ API REST falló: {e}")
 
-    # Opción Correo Secreto
+    # Publicación por Email Secreto
     if GMAIL_USER and GMAIL_APP_PASS and WP_SECRET_EMAIL:
-        print("📧 Publicando vía correo electrónico en WordPress...")
+        print("📧 Publicando vía correo secreto...")
         msg = MIMEMultipart()
         msg['From'] = GMAIL_USER
         msg['To'] = WP_SECRET_EMAIL
@@ -316,17 +305,16 @@ def publicar_en_wordpress(titulo, contenido_html, ruta_imagen):
                 image_mime = MIMEImage(img_data, name=os.path.basename(ruta_imagen))
                 image_mime.add_header('Content-Disposition', 'attachment', filename=os.path.basename(ruta_imagen))
                 msg.attach(image_mime)
-                print("📎 Imagen de miniatura adjuntada con éxito.")
 
         server = smtplib.SMTP('smtp.gmail.com', 587)
         server.starttls()
         server.login(GMAIL_USER, GMAIL_APP_PASS)
         server.send_message(msg)
         server.quit()
-        print("🎉 ¡Correo enviado con éxito a WordPress!")
+        print("🎉 Correo enviado con éxito.")
         return True
 
-    raise Exception("Faltan credenciales de publicación.")
+    raise Exception("Sin credenciales de publicación.")
 
 if __name__ == "__main__":
     tema = obtener_nuevo_tema_viral()
