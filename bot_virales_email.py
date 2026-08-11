@@ -24,13 +24,6 @@ HEADERS_BROWSER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36"
 }
 
-# Lista de modelos de reserva por orden de preferencia
-MODELOS_GEMINI = [
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-    "gemini-2.5-flash"
-]
-
 def cargar_historial():
     if os.path.exists(HISTORIAL_FILE):
         try:
@@ -64,6 +57,33 @@ def obtener_nuevo_tema_viral():
             print(f"⚠️ Error leyendo feed {feed_url}: {e}")
     return None
 
+def obtener_modelos_disponibles():
+    """
+    Consulta dinámicamente a la API de Google cuáles modelos están
+    realmente disponibles para tu clave API y soportan generateContent.
+    """
+    url_list = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
+    try:
+        res = requests.get(url_list, timeout=10)
+        if res.status_code == 200:
+            models_data = res.json().get("models", [])
+            modelos_validos = []
+            for m in models_data:
+                methods = m.get("supportedGenerationMethods", [])
+                if "generateContent" in methods:
+                    # Extrae 'gemini-1.5-flash' desde 'models/gemini-1.5-flash'
+                    nombre_corto = m.get("name", "").replace("models/", "")
+                    if "gemini" in nombre_corto:
+                        modelos_validos.append(nombre_corto)
+            if modelos_validos:
+                print(f"📋 Modelos activos detectados en tu cuenta: {modelos_validos}")
+                return modelos_validos
+    except Exception as e:
+        print(f"⚠️ No se pudo consultar la lista dinámica de modelos: {e}")
+
+    # Fallback manual en caso de fallo de red en la consulta
+    return ["gemini-1.5-flash-latest", "gemini-1.5-pro-latest", "gemini-1.5-flash", "gemini-1.5-pro"]
+
 def generar_articulo_miri(tema_viral):
     prompt = f"""
     Eres la redactora principal del proyecto "Miri te lo cuenta", un portal sobre tendencias de internet, vídeos virales, reality shows y cultura pop.
@@ -87,10 +107,11 @@ def generar_articulo_miri(tema_viral):
         "generationConfig": {"response_mime_type": "application/json"}
     }
 
+    modelos = obtener_modelos_disponibles()
     ultimo_error = ""
 
-    # Probamos sucesivamente con los modelos activos
-    for modelo in MODELOS_GEMINI:
+    # Probamos sucesivamente con los modelos activos encontrados
+    for modelo in modelos:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={GEMINI_API_KEY}"
         try:
             print(f"🤖 Intentando generar contenido con {modelo}...")
