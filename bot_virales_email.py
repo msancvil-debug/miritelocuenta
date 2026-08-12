@@ -106,9 +106,9 @@ def generar_articulo_miri(tema_viral):
     raise Exception("❌ Error: La API de Gemini no pudo generar el artículo.")
 
 def generar_miniatura_canva_pro_api(titulo):
-    """Conecta con la API oficial de Canva para modificar la plantilla real de marca."""
+    """Conecta con la API oficial de Canva y muestra el error exacto si falla."""
     if not (CANVA_CLIENT_ID and CANVA_CLIENT_SECRET and CANVA_TEMPLATE_ID):
-        print("❌ Faltan credenciales de Canva Connect en los Secrets de GitHub.")
+        print("❌ ERROR: Faltan credenciales de Canva (CANVA_CLIENT_ID, CANVA_CLIENT_SECRET o CANVA_TEMPLATE_ID) en GitHub Secrets.")
         return None
 
     print("🎨 Autenticando con la API de Canva Pro...")
@@ -122,7 +122,7 @@ def generar_miniatura_canva_pro_api(titulo):
     try:
         r_token = requests.post(token_url, data=auth_data, timeout=15)
         if r_token.status_code != 200:
-            print(f"❌ Error de autenticación en Canva: {r_token.text}")
+            print(f"❌ ERROR DE AUTENTICACIÓN EN CANVA (Código {r_token.status_code}): {r_token.text}")
             return None
         access_token = r_token.json().get("access_token")
     except Exception as e:
@@ -147,7 +147,6 @@ def generar_miniatura_canva_pro_api(titulo):
 
     asset_id_foto = None
     if foto_bytes:
-        # 2. Subir la imagen a los Assets de Canva para obtener un asset_id válido
         print("🚀 Subiendo imagen a Canva Assets...")
         upload_init_url = "https://api.canva.com/rest/v1/uploads"
         headers_upload = {
@@ -160,10 +159,13 @@ def generar_miniatura_canva_pro_api(titulo):
             if r_up.status_code in [200, 201, 202]:
                 up_data = r_up.json()
                 asset_id_foto = up_data.get("job", {}).get("asset", {}).get("id") or up_data.get("asset", {}).get("id")
+                print(f"✅ Imagen subida a Canva con Asset ID: {asset_id_foto}")
+            else:
+                print(f"⚠️ Error al subir imagen a Canva Assets (Código {r_up.status_code}): {r_up.text}")
         except Exception as e:
-            print(f"⚠️ Error subiendo asset a Canva: {e}")
+            print(f"⚠️ Excepción subiendo asset a Canva: {e}")
 
-    # 3. Lanzar el trabajo de Autofill en la plantilla real
+    # 2. Lanzar el trabajo de Autofill en la plantilla real
     print(f"🪄 Aplicando Autofill en la plantilla de Canva (ID: {CANVA_TEMPLATE_ID})...")
     autofill_url = "https://api.canva.com/rest/v1/autofills"
     
@@ -181,20 +183,21 @@ def generar_miniatura_canva_pro_api(titulo):
     try:
         r_job = requests.post(autofill_url, headers=headers_canva, json=payload_autofill, timeout=20)
         if r_job.status_code not in [200, 201, 202]:
-            print(f"❌ Error al iniciar el autofill en Canva: {r_job.text}")
+            print(f"❌ ERROR CRÍTICO EN CANVA AUTOFILL (Código {r_job.status_code}): {r_job.text}")
             return None
         
         job_json = r_job.json()
         job_id = job_json.get("job", {}).get("id")
+        print(uto_id := f"⏳ Trabajo de Canva iniciado (Job ID: {job_id}). Esperando renderizado...")
         
-        # 4. Esperar a que Canva renderice el diseño
-        print("⏳ Esperando a que Canva procese el diseño final...")
-        for _ in range(12):
+        # 3. Esperar a que Canva renderice el diseño
+        for _ in range(15):
             time.sleep(4)
             r_check = requests.get(f"https://api.canva.com/rest/v1/autofills/{job_id}", headers=headers_canva, timeout=15)
             if r_check.status_code == 200:
                 job_data = r_check.json().get("job", {})
                 status = job_data.get("status")
+                print(f" Estado actual de Canva: {status}")
                 if status == "success":
                     design_url = job_data.get("result", {}).get("url")
                     if design_url:
@@ -206,10 +209,10 @@ def generar_miniatura_canva_pro_api(titulo):
                             print("✅ ¡Miniatura de tu plantilla real de Canva generada y descargada con éxito!")
                             return ruta_local
                 elif status == "failed":
-                    print(f"❌ Error en el renderizado de Canva: {job_data.get('error')}")
+                    print(f"❌ ERROR DETALLADO DE CANVA RENDER: {json.dumps(job_data, indent=2)}")
                     break
     except Exception as e:
-        print(f"❌ Excepción en la API de Canva: {e}")
+        print(f"❌ Excepción grave en el proceso de Canva API: {e}")
 
     return None
 
