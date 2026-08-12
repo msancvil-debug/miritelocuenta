@@ -13,8 +13,8 @@ WP_APP_PASS = (os.environ.get("WP_APP_PASS") or "").strip().replace(" ", "")
 
 HISTORIAL_FILE = "historial_temas.json"
 FEEDS_TENDENCIAS = [
-    "https://news.google.com/rss/search?q=viral+OR+tiktok+OR+telecinco+OR+reality&hl=es&gl=ES&ceid=ES:es",
-    "https://20minutos.es/rss/"
+    "[https://news.google.com/rss/search?q=viral+OR+tiktok+OR+telecinco+OR+reality&hl=es&gl=ES&ceid=ES:es](https://news.google.com/rss/search?q=viral+OR+tiktok+OR+telecinco+OR+reality&hl=es&gl=ES&ceid=ES:es)",
+    "[https://20minutos.es/rss/](https://20minutos.es/rss/)"
 ]
 HEADERS_BROWSER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36"
@@ -54,7 +54,7 @@ def obtener_nuevo_tema_viral():
     return None
 
 def obtener_modelos_disponibles():
-    url_list = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
+    url_list = f"[https://generativelanguage.googleapis.com/v1beta/models?key=](https://generativelanguage.googleapis.com/v1beta/models?key=){GEMINI_API_KEY}"
     try:
         res = requests.get(url_list, timeout=10)
         if res.status_code == 200:
@@ -81,23 +81,47 @@ def generar_articulo_miri(tema_viral):
         "generationConfig": {"response_mime_type": "application/json"}
     }
     for modelo in modelos:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={GEMINI_API_KEY}"
+        url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){modelo}:generateContent?key={GEMINI_API_KEY}"
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=40)
             if response.status_code == 200:
                 raw_text = response.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-                if raw_text.startswith("
-http://googleusercontent.com/immersive_entry_chip/0
-*(No te olvides de darle a **Commit changes...** para guardarlo).*
+                
+                # Arreglo para que no vuelva a fallar por sintaxis al pegar
+                if raw_text.startswith("`"):
+                    raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+                
+                articulo = json.loads(raw_text)
+                titulo_limpio = html.unescape(articulo["titulo"]).strip().strip('"').strip("'")
+                return titulo_limpio, articulo["contenido_html"]
+        except: continue
+    raise Exception("❌ Error: La API de Gemini no pudo generar el artículo.")
 
----
+def publicar_solo_texto_wordpress(titulo, contenido_html):
+    if not (WP_URL and WP_USER and WP_APP_PASS):
+        raise Exception("❌ Faltan credenciales de WordPress en GitHub Secrets.")
 
-### PASO 2: Encender el escenario en Make
-Ahora que Python ya no molesta con las imágenes, vamos a asegurarnos de que tu robot de Make está activo:
+    print(f"🚀 Publicando artículo (SIN IMAGEN) vía API REST en {WP_URL} para que Make lo detecte...")
+    url_posts = f"{WP_URL}/wp-json/wp/v2/posts"
+    payload = {"title": titulo, "content": contenido_html, "status": "publish"}
+    r_post = requests.post(url_posts, json=payload, headers={"Content-Type": "application/json"}, auth=(WP_USER, WP_APP_PASS), timeout=30)
+    
+    if r_post.status_code in [200, 201]:
+        print("🎉 ¡ÉXITO! Entrada publicada. Ahora Make entrará en acción para añadir la imagen de Canva.")
+        return True
+    else:
+        raise Exception(f"❌ ERROR DE PUBLICACIÓN (Código {r_post.status_code}): {r_post.text}")
 
-1. Entra en tu cuenta de **Make** (`make.com`).
-2. Ve a **Scenarios** y entra en el que construimos para Miri.
-3. Asegúrate de que **el interruptor (ON/OFF)** abajo a la izquierda está en **ON**.
-4. *(Opcional)*: Puedes darle al botón grande **"Run once"** (Ejecutar una vez) justo después de probar el flujo en GitHub para forzar a Make a que busque el artículo que acaba de publicarse y le ponga la foto de Canva.
+if __name__ == "__main__":
+    tema = obtener_nuevo_tema_viral()
+    if not tema:
+        print("⚠️ Sin temas nuevos. Usando tema de prueba...")
+        tema = "Polémica viral de la semana en redes sociales"
 
-Ejecútalo desde GitHub, y verás cómo Make toma el relevo perfectamente usando tu Canva Pro. ¡Dime si esta vez sí te sube el diseño de tu plantilla oficial!
+    print(f"🔥 Tema seleccionado: {tema}")
+    titulo, contenido_html = generar_articulo_miri(tema)
+
+    if titulo and contenido_html:
+        publicado = publicar_solo_texto_wordpress(titulo, contenido_html)
+        if publicado:
+            guardar_en_historial(tema)
