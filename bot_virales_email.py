@@ -13,8 +13,8 @@ WP_APP_PASS = (os.environ.get("WP_APP_PASS") or "").strip().replace(" ", "")
 
 HISTORIAL_FILE = "historial_temas.json"
 FEEDS_TENDENCIAS = [
-    "[https://news.google.com/rss/search?q=viral+OR+tiktok+OR+telecinco+OR+reality&hl=es&gl=ES&ceid=ES:es](https://news.google.com/rss/search?q=viral+OR+tiktok+OR+telecinco+OR+reality&hl=es&gl=ES&ceid=ES:es)",
-    "[https://20minutos.es/rss/](https://20minutos.es/rss/)"
+    "https://news.google.com/rss/search?q=viral+OR+tiktok+OR+telecinco+OR+reality&hl=es&gl=ES&ceid=ES:es",
+    "https://20minutos.es/rss/"
 ]
 HEADERS_BROWSER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36"
@@ -54,7 +54,11 @@ def obtener_nuevo_tema_viral():
     return None
 
 def obtener_modelos_disponibles():
-    url_list = f"[https://generativelanguage.googleapis.com/v1beta/models?key=](https://generativelanguage.googleapis.com/v1beta/models?key=){GEMINI_API_KEY}"
+    if not GEMINI_API_KEY:
+        print("⚠️ ALERTA: No se ha detectado GEMINI_API_KEY. El programa fallará.")
+        return ["gemini-1.5-flash"]
+        
+    url_list = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
     try:
         res = requests.get(url_list, timeout=10)
         if res.status_code == 200:
@@ -80,22 +84,30 @@ def generar_articulo_miri(tema_viral):
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"response_mime_type": "application/json"}
     }
+    
     for modelo in modelos:
-        url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){modelo}:generateContent?key={GEMINI_API_KEY}"
+        print(f"🤖 Intentando generar artículo con el modelo: {modelo}...")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={GEMINI_API_KEY}"
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=40)
             if response.status_code == 200:
                 raw_text = response.json()['candidates'][0]['content']['parts'][0]['text'].strip()
                 
-                # Arreglo para que no vuelva a fallar por sintaxis al pegar
-                if raw_text.startswith("`"):
-                    raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+                # Súper limpieza de formato por si Gemini devuelve basura alrededor del JSON
+                raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+                if raw_text.startswith("`"): raw_text = raw_text.strip("`")
                 
                 articulo = json.loads(raw_text)
                 titulo_limpio = html.unescape(articulo["titulo"]).strip().strip('"').strip("'")
+                print("✅ Artículo generado correctamente por Gemini.")
                 return titulo_limpio, articulo["contenido_html"]
-        except: continue
-    raise Exception("❌ Error: La API de Gemini no pudo generar el artículo.")
+            else:
+                print(f"❌ Error devuelto por Gemini ({response.status_code}): {response.text}")
+        except Exception as e:
+            print(f"⚠️ Fallo al leer la respuesta del modelo {modelo}: {e}")
+            continue
+            
+    raise Exception("❌ Error crítico: La API de Gemini falló. Revisa los mensajes de arriba para ver el error exacto.")
 
 def publicar_solo_texto_wordpress(titulo, contenido_html):
     if not (WP_URL and WP_USER and WP_APP_PASS):
