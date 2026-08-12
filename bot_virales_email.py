@@ -138,14 +138,13 @@ def generar_articulo_miri(tema_viral):
         except Exception:
             continue
 
-    raise Exception("Error crítico: Ningún modelo de Gemini pudo generar el artículo.")
+    raise Exception("❌ Error crítico: Ningún modelo de Gemini pudo generar el artículo.")
 
 def crear_imagen_destacada(titulo):
     """Genera la miniatura profesional con faldón amarillo y foto de fondo de alta calidad."""
     width, height = 1200, 630
     ruta_local = "miniatura_destacada.jpg"
 
-    # Descargar foto de fondo temática segura
     bg_img = None
     try:
         url_foto = random.choice(FOTOS_STOCK_TEMATICAS)
@@ -158,7 +157,6 @@ def crear_imagen_destacada(titulo):
     if not bg_img:
         bg_img = Image.new("RGBA", (width, height), (35, 35, 40, 255))
 
-    # Oscurecer ligeramente para resaltar el texto
     overlay = Image.new("RGBA", (width, height), (0, 0, 0, 85))
     img = Image.alpha_composite(bg_img, overlay)
     draw = ImageDraw.Draw(img)
@@ -167,11 +165,9 @@ def crear_imagen_destacada(titulo):
     box_x1, box_y1 = margin, 120
     box_x2, box_y2 = width - margin, height - 80
 
-    # Sombra y caja amarilla corporativa
     draw.rectangle([box_x1 + 8, box_y1 + 8, box_x2 + 8, box_y2 + 8], fill=(22, 22, 22, 255))
     draw.rectangle([box_x1, box_y1, box_x2, box_y2], fill=(255, 216, 77, 255), outline=(22, 22, 22, 255), width=5)
 
-    # Placa "MIRI TE LO CUENTA"
     badge_x1, badge_y1 = margin + 20, 50
     badge_x2, badge_y2 = margin + 380, 100
     draw.rectangle([badge_x1 + 4, badge_y1 + 4, badge_x2 + 4, badge_y2 + 4], fill=(22, 22, 22, 255))
@@ -195,75 +191,57 @@ def crear_imagen_destacada(titulo):
     return ruta_local
 
 def publicar_en_wordpress(titulo, contenido_html, ruta_imagen):
-    if WP_URL and WP_USER and WP_APP_PASS:
-        try:
-            print("🚀 Publicando vía API REST de WordPress...")
-            url_media = f"{WP_URL}/wp-json/wp/v2/media"
-            with open(ruta_imagen, "rb") as f:
-                media_bytes = f.read()
-            
-            headers_media = {
-                "Content-Disposition": f"attachment; filename={os.path.basename(ruta_imagen)}",
-                "Content-Type": "image/jpeg"
-            }
-            r_media = requests.post(url_media, data=media_bytes, headers=headers_media, auth=(WP_USER, WP_APP_PASS), timeout=30)
-            
-            media_id = None
-            url_foto = ""
-            if r_media.status_code in [200, 201]:
-                media_json = r_media.json()
-                media_id = media_json.get("id")
-                url_foto = media_json.get("source_url", "")
+    if not (WP_URL and WP_USER and WP_APP_PASS):
+        raise Exception(f"❌ ERROR: Faltan credenciales de WordPress. WP_URL='{WP_URL}', WP_USER='{WP_USER}', WP_APP_PASS='{len(WP_APP_PASS)} caracteres'")
 
-            html_final = f"""
-            <div style="margin-bottom: 20px; text-align: center;">
-                <img src="{url_foto}" alt="{titulo}" style="max-width: 100%; height: auto; border-radius: 8px; border: 2px solid #161616;" />
-            </div>
-            {contenido_html}
-            """
+    print(f"🚀 Publicando vía API REST en {WP_URL}...")
+    
+    # 1. Subir imagen
+    url_media = f"{WP_URL}/wp-json/wp/v2/media"
+    with open(ruta_imagen, "rb") as f:
+        media_bytes = f.read()
+    
+    headers_media = {
+        "Content-Disposition": f"attachment; filename={os.path.basename(ruta_imagen)}",
+        "Content-Type": "image/jpeg"
+    }
+    
+    r_media = requests.post(url_media, data=media_bytes, headers=headers_media, auth=(WP_USER, WP_APP_PASS), timeout=30)
+    
+    media_id = None
+    url_foto = ""
+    if r_media.status_code in [200, 201]:
+        media_json = r_media.json()
+        media_id = media_json.get("id")
+        url_foto = media_json.get("source_url", "")
+    else:
+        print(f"⚠️ La subida de imagen a la API REST devolvió código {r_media.status_code}: {r_media.text}")
 
-            url_posts = f"{WP_URL}/wp-json/wp/v2/posts"
-            payload = {"title": titulo, "content": html_final, "status": "publish"}
-            if media_id:
-                payload["featured_media"] = media_id
+    html_final = f"""
+    <div style="margin-bottom: 20px; text-align: center;">
+        <img src="{url_foto}" alt="{titulo}" style="max-width: 100%; height: auto; border-radius: 8px; border: 2px solid #161616;" />
+    </div>
+    {contenido_html}
+    """
 
-            r_post = requests.post(url_posts, json=payload, headers={"Content-Type": "application/json"}, auth=(WP_USER, WP_APP_PASS), timeout=30)
-            if r_post.status_code in [200, 201]:
-                print("🎉 ¡Publicado con éxito en WordPress vía API REST!")
-                return True
-        except Exception as e:
-            print(f"⚠️ API REST falló: {e}")
+    # 2. Publicar Entrada
+    url_posts = f"{WP_URL}/wp-json/wp/v2/posts"
+    payload = {"title": titulo, "content": html_final, "status": "publish"}
+    if media_id:
+        payload["featured_media"] = media_id
 
-    if GMAIL_USER and GMAIL_APP_PASS and WP_SECRET_EMAIL:
-        print("📧 Publicando vía correo secreto a WordPress...")
-        msg = MIMEMultipart()
-        msg['From'] = GMAIL_USER
-        msg['To'] = WP_SECRET_EMAIL
-        msg['Subject'] = titulo
-
-        msg.attach(MIMEText(contenido_html, 'html'))
-
-        if ruta_imagen and os.path.exists(ruta_imagen):
-            with open(ruta_imagen, 'rb') as f:
-                img_data = f.read()
-                image_mime = MIMEImage(img_data, name=os.path.basename(ruta_imagen))
-                image_mime.add_header('Content-Disposition', 'attachment', filename=os.path.basename(ruta_imagen))
-                msg.attach(image_mime)
-
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
-        server.login(GMAIL_USER, GMAIL_APP_PASS)
-        server.send_message(msg)
-        server.quit()
-        print("🎉 Correo enviado con éxito a WordPress.")
+    r_post = requests.post(url_posts, json=payload, headers={"Content-Type": "application/json"}, auth=(WP_USER, WP_APP_PASS), timeout=30)
+    
+    if r_post.status_code in [200, 201]:
+        print("🎉 ¡ÉXITO TOTAL! Entrada publicada con éxito en WordPress vía API REST.")
         return True
-
-    raise Exception("Sin credenciales de publicación.")
+    else:
+        raise Exception(f"❌ ERROR DE PUBLICACIÓN (Código {r_post.status_code}): {r_post.text}")
 
 if __name__ == "__main__":
     tema = obtener_nuevo_tema_viral()
     if not tema:
-        print("⚠️ Sin temas nuevos. Usando tema por defecto...")
+        print("⚠️ Sin temas nuevos en el feed. Usando tema de prueba...")
         tema = "Tendencias y polémica viral de la semana en redes sociales"
 
     print(f"🔥 Tema seleccionado: {tema}")
