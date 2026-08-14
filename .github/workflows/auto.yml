@@ -1,34 +1,35 @@
-name: Automata Virales Miri Email
+name: Auto Publicar Miri Te Lo Cuenta
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # Cada 6 horas
-  workflow_dispatch:        # Ejecución manual
+    - cron: '0 8 * * *' # Todos los días a las 8:00 AM
+  workflow_dispatch:
 
 jobs:
-  run-bot:
+  publicar:
     runs-on: ubuntu-latest
     steps:
-      - name: Descargar código del repositorio
+      - name: Clonar repositorio
         uses: actions/checkout@v4
 
-      - name: Configurar entorno Python
+      - name: Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Instalar librerías necesarias
+      - name: Instalar dependencias
         run: |
-          python -m pip install --upgrade pip
-          pip install google-genai requests Pillow
+          pip install --upgrade pip
+          pip install requests Pillow playwright
 
-      - name: Ejecutar el Robot de Miri
+      - name: Instalar navegador Playwright (Chromium)
+        run: |
+          python -m playwright install --with-deps chromium
+
+      - name: Ejecutar bot de publicaciones
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           WP_URL: ${{ secrets.WP_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASS: ${{ secrets.WP_APP_PASS }}
-          CANVA_CLIENT_ID: ${{ secrets.CANVA_CLIENT_ID }}
-          CANVA_CLIENT_SECRET: ${{ secrets.CANVA_CLIENT_SECRET }}
-          CANVA_TEMPLATE_ID: ${{ secrets.CANVA_TEMPLATE_ID }}
-        run: python bot_virales_email.py
+        run: python miri_bot_html_modificado.py
