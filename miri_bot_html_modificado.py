@@ -5,6 +5,9 @@ import html
 import re
 import mimetypes
 import unicodedata
+import subprocess
+import shutil
+from datetime import datetime
 import xml.etree.ElementTree as ET
 from io import BytesIO
 
@@ -15,7 +18,8 @@ from PIL import Image, ImageDraw, ImageFont, ImageStat
 # ============================================================
 # FLUJO:
 # RSS -> Gemini -> selección visual editorial -> miniatura 1200x630
-# -> WordPress -> historial
+# -> copies sociales -> imágenes verticales -> MP4 5 s
+# -> WordPress -> pack social -> historial
 #
 # MOTOR VISUAL:
 # 1) Identifica el tipo visual:
@@ -36,6 +40,10 @@ from PIL import Image, ImageDraw, ImageFont, ImageStat
 # Requisitos Python:
 #   requests
 #   pillow
+#
+# Para generar MP4:
+#   ffmpeg disponible en el sistema (recomendado).
+# Si no existe, el bot no falla: genera igualmente ambas imágenes sociales.
 # ============================================================
 
 
@@ -97,6 +105,33 @@ UMBRAL_SCORE = {
 }
 
 OUTPUT_IMAGE = "miniatura_destacada.jpg"
+
+# Pack social generado automáticamente por cada artículo.
+SOCIAL_OUTPUT_DIR = "social_output"
+OUTPUT_SOCIAL_POST = os.path.join(
+    SOCIAL_OUTPUT_DIR,
+    "social_post_1080x1350.jpg"
+)
+OUTPUT_SOCIAL_VERTICAL = os.path.join(
+    SOCIAL_OUTPUT_DIR,
+    "social_vertical_1080x1920.jpg"
+)
+OUTPUT_SOCIAL_VIDEO = os.path.join(
+    SOCIAL_OUTPUT_DIR,
+    "social_video_1080x1920.mp4"
+)
+OUTPUT_SOCIAL_JSON = os.path.join(
+    SOCIAL_OUTPUT_DIR,
+    "social_pack.json"
+)
+OUTPUT_SOCIAL_TXT = os.path.join(
+    SOCIAL_OUTPUT_DIR,
+    "social_copies.txt"
+)
+
+# 5 segundos: supera el mínimo de 3 s exigido por TikTok/Metricool
+# para la publicación automática de vídeo.
+SOCIAL_VIDEO_SECONDS = 5
 
 # Branding Miri te lo cuenta
 COLOR_BG = "#E9E1DA"
@@ -661,6 +696,315 @@ REGLAS EDITORIALES PARA ELEGIR LA IMAGEN:
     )
 
 
+
+# ==========================================
+# 5B. PACK DE COPIES PARA REDES SOCIALES
+# ==========================================
+def normalizar_hashtags(valor):
+    hashtags = []
+
+    for item in asegurar_lista(
+        valor
+    ):
+        item = normalizar_texto(
+            item
+        ).replace(
+            " ",
+            ""
+        )
+
+        if not item:
+            continue
+
+        tag = (
+            "#"
+            + item.lstrip("#")
+        )
+
+        if (
+            len(tag) <= 40
+            and tag not in hashtags
+        ):
+            hashtags.append(
+                tag
+            )
+
+    return hashtags[:6]
+
+
+def generar_pack_social_gemini(
+    tema_viral,
+    titulo_articulo,
+    contenido_html,
+    entidad_principal,
+    contexto_visual
+):
+    """
+    Genera copies orientados a descubrimiento/búsqueda social.
+
+    No usa datos de volumen de búsqueda en tiempo real.
+    Optimiza por claridad semántica:
+    - entidad o tema exacto al principio
+    - nombres propios completos
+    - lenguaje natural
+    - sin keyword stuffing
+    - sin inventar hechos no presentes en el artículo
+    """
+    modelos = obtener_modelos_disponibles()
+
+    texto_articulo = limpiar_html_tags(
+        contenido_html
+    )
+
+    texto_articulo = limitar_texto(
+        texto_articulo,
+        3500
+    )
+
+    prompt = f"""
+Eres estratega SEO/social para "Miri te lo cuenta".
+
+A partir EXCLUSIVAMENTE de este artículo, prepara un pack
+para publicar automáticamente en redes.
+
+TEMA ORIGINAL:
+{tema_viral}
+
+TÍTULO DEL ARTÍCULO:
+{titulo_articulo}
+
+ENTIDAD PRINCIPAL:
+{entidad_principal}
+
+CONTEXTO:
+{contexto_visual}
+
+TEXTO DEL ARTÍCULO:
+{texto_articulo}
+
+OBJETIVO:
+Que cada texto sea fácil de encontrar cuando alguien busque
+el nombre de la persona, programa, reality, influencer, ciudad,
+polémica o tema principal dentro de cada red.
+
+REGLAS:
+- No inventes ningún hecho.
+- No inventes fechas, cifras ni declaraciones.
+- Empieza los titulares por la entidad/tema principal cuando sea natural.
+- Usa nombres propios completos.
+- No hagas keyword stuffing.
+- No uses hashtags genéricos como #fyp, #viral o #parati salvo
+  que sean realmente parte del tema.
+- Prioriza 3-6 hashtags muy concretos.
+- El titular de la imagen debe entenderse sin leer el pie.
+- En Instagram y TikTok usa "link en bio" en vez de pegar una URL.
+- En Facebook y YouTube deja el marcador {{URL}} para el artículo.
+- TikTok no necesita saltos de línea.
+- YouTube Shorts: título máximo 100 caracteres.
+- titulo_social: máximo 68 caracteres y 4-10 palabras.
+
+Devuelve ÚNICAMENTE JSON válido con esta estructura:
+
+{{
+  "titulo_social": "Titular corto, claro y buscable",
+  "facebook": "Copy de Facebook con contexto breve y {{URL}}",
+  "instagram": "Copy de Instagram con gancho, palabras clave y CTA link en bio",
+  "tiktok": "Copy corto de TikTok en una sola línea",
+  "youtube_titulo": "Título para YouTube Shorts",
+  "youtube_descripcion": "Descripción breve con contexto y {{URL}}",
+  "hashtags": ["#tema1", "#tema2", "#tema3"],
+  "keywords_busqueda": ["keyword 1", "keyword 2", "keyword 3"]
+}}
+"""
+
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "temperature": 0.45
+        }
+    }
+
+    for modelo in modelos:
+        url = (
+            "https://generativelanguage.googleapis.com/"
+            "v1beta/models/"
+            f"{modelo}:generateContent"
+            f"?key={GEMINI_API_KEY}"
+        )
+
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=50
+            )
+
+            if response.status_code != 200:
+                continue
+
+            data = response.json()
+
+            raw_text = (
+                data["candidates"][0]
+                ["content"]
+                ["parts"][0]
+                ["text"]
+                .strip()
+            )
+
+            pack = extraer_json_de_respuesta(
+                raw_text
+            )
+
+            titulo_social = html.unescape(
+                pack.get(
+                    "titulo_social",
+                    titulo_articulo
+                )
+                or titulo_articulo
+            ).strip()
+
+            hashtags = normalizar_hashtags(
+                pack.get(
+                    "hashtags",
+                    []
+                )
+            )
+
+            keywords = deduplicar_lista(
+                asegurar_lista(
+                    pack.get(
+                        "keywords_busqueda",
+                        []
+                    )
+                )
+            )[:8]
+
+            return {
+                "titulo_social": limitar_texto(
+                    titulo_social,
+                    68
+                ),
+                "facebook": (
+                    html.unescape(
+                        str(
+                            pack.get(
+                                "facebook",
+                                ""
+                            )
+                            or ""
+                        )
+                    ).strip()
+                ),
+                "instagram": (
+                    html.unescape(
+                        str(
+                            pack.get(
+                                "instagram",
+                                ""
+                            )
+                            or ""
+                        )
+                    ).strip()
+                ),
+                "tiktok": (
+                    html.unescape(
+                        str(
+                            pack.get(
+                                "tiktok",
+                                ""
+                            )
+                            or ""
+                        )
+                    )
+                    .replace(
+                        "\n",
+                        " "
+                    )
+                    .strip()
+                ),
+                "youtube_titulo": limitar_texto(
+                    html.unescape(
+                        str(
+                            pack.get(
+                                "youtube_titulo",
+                                titulo_social
+                            )
+                            or titulo_social
+                        )
+                    ).strip(),
+                    100
+                ),
+                "youtube_descripcion": (
+                    html.unescape(
+                        str(
+                            pack.get(
+                                "youtube_descripcion",
+                                ""
+                            )
+                            or ""
+                        )
+                    ).strip()
+                ),
+                "hashtags": hashtags,
+                "keywords_busqueda": keywords,
+            }
+
+        except Exception as e:
+            print(
+                f"⚠️ Pack social: fallo con {modelo}: {e}"
+            )
+
+    # Fallback determinista si Gemini falla.
+    titulo_fallback = limitar_texto(
+        titulo_articulo,
+        68
+    )
+
+    return {
+        "titulo_social": titulo_fallback,
+        "facebook": (
+            f"{titulo_fallback}\n\n"
+            "Te cuento el contexto completo aquí: {URL}"
+        ),
+        "instagram": (
+            f"{titulo_fallback}. "
+            "Te cuento el contexto completo en el blog. Link en bio."
+        ),
+        "tiktok": (
+            f"{titulo_fallback}. "
+            "Más contexto en el blog, link en bio."
+        ),
+        "youtube_titulo": limitar_texto(
+            titulo_fallback,
+            100
+        ),
+        "youtube_descripcion": (
+            f"{titulo_fallback}\n\n"
+            "Artículo completo: {URL}"
+        ),
+        "hashtags": [],
+        "keywords_busqueda": [
+            entidad_principal
+            or tema_viral
+        ],
+    }
+
+
 # ==========================================
 # 6. BÚSQUEDAS VISUALES
 # ==========================================
@@ -690,13 +1034,13 @@ def enriquecer_busquedas_lugar(
             f"{entidad} beach",
             f"{entidad} promenade",
             f"{entidad} tourism",
-            f"{entidad} Spain",
+            f"{entidad} landscape",
         ])
 
     if entidad and contexto:
         base.extend([
             f"{entidad} {contexto}",
-            f"{entidad} {contexto} Spain",
+            f"{entidad} {contexto} city",
         ])
 
     return deduplicar_lista(
@@ -997,7 +1341,6 @@ def buscar_imagenes_wikimedia(
                         credit,
                         object_name,
                         categories,
-                        query,
                     ]
                 )
             )
@@ -1179,7 +1522,6 @@ def buscar_imagenes_openverse(
                         description,
                         artist,
                         source,
-                        query,
                         source_page,
                     ]
                 )
@@ -1482,7 +1824,7 @@ def puntuar_candidato(
         if parece_imagen_grupal_por_metadatos(
             candidato
         ):
-            score -= 40
+            return -999
 
     # --------------------
     # PROGRAMA / MARCA / EVENTO
@@ -1794,10 +2136,9 @@ def evaluar_y_descargar_candidatos(
         if score <= -900:
             continue
 
+        candidato = dict(candidato)
         candidato["score_metadata"] = score
-        puntuados.append(
-            candidato
-        )
+        puntuados.append(candidato)
 
     puntuados.sort(
         key=lambda x: x.get(
@@ -1812,7 +2153,12 @@ def evaluar_y_descargar_candidatos(
         42
     )
 
-    # Probamos máximo 10 para no eternizar la ejecución.
+    mejor_ruta = None
+    mejor_candidato = None
+    mejor_score = -99999
+
+    # Descargamos y evaluamos hasta 10 candidatos completos.
+    # Ya no se devuelve el primero que pasa: se elige el mejor.
     for indice, candidato in enumerate(
         puntuados[:10],
         start=1
@@ -1825,85 +2171,103 @@ def evaluar_y_descargar_candidatos(
         if not ruta:
             continue
 
-        analisis = analizar_imagen_real(
-            ruta
-        )
+        conservar_ruta = False
 
-        score = candidato.get(
-            "score_metadata",
-            0
-        )
-
-        ancho = analisis.get(
-            "width",
-            0
-        )
-
-        alto = analisis.get(
-            "height",
-            0
-        )
-
-        if (
-            ancho >= 1200
-            and alto >= 630
-        ):
-            score += 8
-
-        elif (
-            ancho
-            and alto
-            and (
-                ancho < 500
-                or alto < 300
-            )
-        ):
-            score -= 25
-
-        # Blanco y negro / casi monocroma
-        if analisis.get(
-            "casi_monocroma"
-        ):
-            score -= 24
-        else:
-            score += 5
-
-        # Segunda capa para noticias sobre una única persona:
-        # si OpenCV está disponible y detecta más de una cara,
-        # descartamos la imagen.
-        if tipo_visual == "persona":
-            caras = contar_personas_aprox_imagen(
+        try:
+            analisis = analizar_imagen_real(
                 ruta
             )
 
+            score = candidato.get(
+                "score_metadata",
+                0
+            )
+
+            ancho = analisis.get(
+                "width",
+                0
+            )
+
+            alto = analisis.get(
+                "height",
+                0
+            )
+
             if (
-                caras is not None
-                and caras >= 2
+                ancho >= 1200
+                and alto >= 630
             ):
-                print(
-                    "🚫 Foto descartada: "
-                    f"parece contener {caras} personas "
-                    "y la noticia es sobre una sola persona."
+                score += 8
+
+            elif (
+                ancho
+                and alto
+                and (
+                    ancho < 500
+                    or alto < 300
+                )
+            ):
+                score -= 25
+
+            # Preferencia por horizontal para casi todos los usos.
+            if ancho > 0 and alto > 0:
+                ratio = ancho / alto
+
+                if tipo_visual in {
+                    "lugar",
+                    "programa",
+                    "marca",
+                    "evento",
+                    "tema",
+                }:
+                    if ratio >= 1.20:
+                        score += 8
+                    elif ratio < 0.90:
+                        score -= 14
+
+                elif tipo_visual == "persona":
+                    # Una foto vertical de persona puede ser perfectamente útil.
+                    if ratio >= 0.72:
+                        score += 3
+
+            # Blanco y negro / casi monocroma.
+            if analisis.get(
+                "casi_monocroma"
+            ):
+                score -= 24
+            else:
+                score += 5
+
+            # Segunda capa para noticias sobre una única persona:
+            # si OpenCV está disponible y detecta más de una cara,
+            # descartamos la imagen.
+            if tipo_visual == "persona":
+                caras = contar_personas_aprox_imagen(
+                    ruta
                 )
 
-                try:
-                    os.remove(
-                        ruta
+                if (
+                    caras is not None
+                    and caras >= 2
+                ):
+                    print(
+                        "🚫 Foto descartada: "
+                        f"parece contener {caras} personas "
+                        "y la noticia es sobre una sola persona."
                     )
-                except Exception:
-                    pass
+                    continue
 
+            print(
+                "🧪 "
+                f"{candidato.get('engine')} | "
+                f"score={score} | "
+                f"{candidato.get('title') or 'sin título'} | "
+                f"monocroma={analisis.get('casi_monocroma')}"
+            )
+
+            if score < umbral:
                 continue
 
-        print(
-            "🧪 "
-            f"{candidato.get('engine')} | "
-            f"score={score} | "
-            f"{candidato.get('title') or 'sin título'} | "
-            f"monocroma={analisis.get('casi_monocroma')}"
-        )
-
-        if score >= umbral:
             candidato[
                 "score_final"
             ] = score
@@ -1916,19 +2280,57 @@ def evaluar_y_descargar_candidatos(
                 "height_real"
             ] = alto
 
-            print(
-                "✅ Imagen aprobada: "
-                f"{candidato.get('title') or candidato.get('source_page')}"
-            )
+            if score > mejor_score:
+                if (
+                    mejor_ruta
+                    and os.path.exists(
+                        mejor_ruta
+                    )
+                ):
+                    try:
+                        os.remove(
+                            mejor_ruta
+                        )
+                    except Exception:
+                        pass
 
-            return ruta, candidato
+                mejor_score = score
+                mejor_ruta = ruta
+                mejor_candidato = candidato
+                conservar_ruta = True
 
-        try:
-            os.remove(
-                ruta
-            )
-        except Exception:
-            pass
+                print(
+                    "⭐ Mejor candidata provisional: "
+                    f"{candidato.get('title') or candidato.get('source_page')} "
+                    f"(score {score})"
+                )
+
+        finally:
+            if (
+                not conservar_ruta
+                and ruta
+                and os.path.exists(
+                    ruta
+                )
+            ):
+                try:
+                    os.remove(
+                        ruta
+                    )
+                except Exception:
+                    pass
+
+    if mejor_ruta and mejor_candidato:
+        print(
+            "✅ Imagen final aprobada: "
+            f"{mejor_candidato.get('title') or mejor_candidato.get('source_page')} "
+            f"(score {mejor_score})"
+        )
+
+        return (
+            mejor_ruta,
+            mejor_candidato
+        )
 
     return None, None
 
@@ -2933,6 +3335,1025 @@ def generar_miniatura(
     )
 
 
+
+# ==========================================
+# 19B. ACTIVOS SOCIALES
+# ==========================================
+def asegurar_directorio_social():
+    os.makedirs(
+        SOCIAL_OUTPUT_DIR,
+        exist_ok=True
+    )
+
+
+def extraer_zona_foto_miniatura(
+    ruta_thumbnail
+):
+    """
+    La miniatura 1200x630 del bot tiene una zona fotográfica
+    superior de aproximadamente 397 px. Reutilizamos esa zona
+    para crear formatos verticales sin duplicar el titular
+    que ya existe en el faldón inferior.
+    """
+    with Image.open(
+        ruta_thumbnail
+    ) as im:
+        im = im.convert(
+            "RGB"
+        )
+
+        corte = int(
+            im.height * 0.63
+        )
+
+        return im.crop(
+            (
+                0,
+                0,
+                im.width,
+                max(
+                    1,
+                    corte
+                )
+            )
+        )
+
+
+def crear_social_post_1080x1350(
+    ruta_thumbnail,
+    titulo_social,
+    categoria_visual,
+    ruta_salida=OUTPUT_SOCIAL_POST
+):
+    asegurar_directorio_social()
+
+    W = 1080
+    H = 1350
+    PHOTO_H = 650
+
+    canvas = Image.new(
+        "RGB",
+        (W, H),
+        COLOR_BG
+    )
+
+    try:
+        foto = extraer_zona_foto_miniatura(
+            ruta_thumbnail
+        )
+
+        foto = ajustar_cobertura(
+            foto,
+            W,
+            PHOTO_H
+        ).convert(
+            "RGB"
+        )
+
+        canvas.paste(
+            foto,
+            (0, 0)
+        )
+
+    except Exception:
+        fallback = crear_fondo_fallback(
+            (
+                W,
+                PHOTO_H
+            )
+        ).convert(
+            "RGB"
+        )
+
+        canvas.paste(
+            fallback,
+            (0, 0)
+        )
+
+    draw = ImageDraw.Draw(
+        canvas
+    )
+
+    # Zona editorial.
+    draw.rectangle(
+        (
+            0,
+            PHOTO_H,
+            W,
+            H
+        ),
+        fill=COLOR_BLACK
+    )
+
+    draw.rectangle(
+        (
+            0,
+            PHOTO_H,
+            W,
+            PHOTO_H + 12
+        ),
+        fill=COLOR_RED
+    )
+
+    font_cat = cargar_fuente(
+        19,
+        bold=True
+    )
+
+    longitud = len(
+        titulo_social
+        or ""
+    )
+
+    if longitud <= 34:
+        title_size = 66
+    elif longitud <= 50:
+        title_size = 58
+    else:
+        title_size = 51
+
+    font_title = cargar_fuente(
+        title_size,
+        bold=True
+    )
+
+    font_brand = cargar_fuente(
+        42,
+        bold=True
+    )
+
+    font_small = cargar_fuente(
+        17,
+        bold=True
+    )
+
+    categoria = (
+        categoria_visual
+        or "ACTUALIDAD"
+    ).upper().strip()
+
+    draw_pill(
+        draw,
+        64,
+        PHOTO_H + 48,
+        categoria,
+        font_cat,
+        fill=COLOR_YELLOW,
+        text_fill=COLOR_BLACK,
+        outline=None,
+        padding_x=16,
+        padding_y=8
+    )
+
+    titulo_social = limitar_texto(
+        titulo_social
+        or "Lo último de Internet",
+        78
+    )
+
+    lineas = envolver_texto(
+        draw,
+        titulo_social,
+        font_title,
+        930
+    )[:4]
+
+    y = PHOTO_H + 112
+    line_h = int(
+        title_size * 1.08
+    )
+
+    for i, linea in enumerate(
+        lineas
+    ):
+        draw.text(
+            (
+                64,
+                y + i * line_h
+            ),
+            linea,
+            font=font_title,
+            fill=COLOR_WHITE
+        )
+
+    # Firma.
+    firma_y = H - 128
+
+    draw.text(
+        (
+            64,
+            firma_y
+        ),
+        "Miri",
+        font=font_brand,
+        fill=COLOR_WHITE
+    )
+
+    draw.rounded_rectangle(
+        (
+            180,
+            firma_y + 4,
+            364,
+            firma_y + 48
+        ),
+        radius=12,
+        fill=COLOR_RED
+    )
+
+    draw.text(
+        (
+            194,
+            firma_y + 15
+        ),
+        "te lo cuenta",
+        font=font_small,
+        fill=COLOR_WHITE
+    )
+
+    draw.text(
+        (
+            W - 252,
+            firma_y + 16
+        ),
+        "@miritelocuenta",
+        font=font_small,
+        fill=COLOR_LIGHT_GREY
+    )
+
+    canvas.save(
+        ruta_salida,
+        format="JPEG",
+        quality=92,
+        optimize=True
+    )
+
+    return ruta_salida
+
+
+def crear_social_vertical_1080x1920(
+    ruta_thumbnail,
+    titulo_social,
+    categoria_visual,
+    ruta_salida=OUTPUT_SOCIAL_VERTICAL
+):
+    asegurar_directorio_social()
+
+    W = 1080
+    H = 1920
+    PHOTO_H = 1000
+
+    canvas = Image.new(
+        "RGB",
+        (W, H),
+        COLOR_BG
+    )
+
+    try:
+        foto = extraer_zona_foto_miniatura(
+            ruta_thumbnail
+        )
+
+        foto = ajustar_cobertura(
+            foto,
+            W,
+            PHOTO_H
+        ).convert(
+            "RGB"
+        )
+
+        canvas.paste(
+            foto,
+            (0, 0)
+        )
+
+    except Exception:
+        fallback = crear_fondo_fallback(
+            (
+                W,
+                PHOTO_H
+            )
+        ).convert(
+            "RGB"
+        )
+
+        canvas.paste(
+            fallback,
+            (0, 0)
+        )
+
+    draw = ImageDraw.Draw(
+        canvas
+    )
+
+    draw.rectangle(
+        (
+            0,
+            PHOTO_H,
+            W,
+            H
+        ),
+        fill=COLOR_BLACK
+    )
+
+    draw.rectangle(
+        (
+            0,
+            PHOTO_H,
+            W,
+            PHOTO_H + 14
+        ),
+        fill=COLOR_RED
+    )
+
+    font_cat = cargar_fuente(
+        21,
+        bold=True
+    )
+
+    longitud = len(
+        titulo_social
+        or ""
+    )
+
+    if longitud <= 34:
+        title_size = 76
+    elif longitud <= 50:
+        title_size = 68
+    else:
+        title_size = 59
+
+    font_title = cargar_fuente(
+        title_size,
+        bold=True
+    )
+
+    font_brand = cargar_fuente(
+        48,
+        bold=True
+    )
+
+    font_small = cargar_fuente(
+        19,
+        bold=True
+    )
+
+    categoria = (
+        categoria_visual
+        or "ACTUALIDAD"
+    ).upper().strip()
+
+    draw_pill(
+        draw,
+        68,
+        PHOTO_H + 58,
+        categoria,
+        font_cat,
+        fill=COLOR_YELLOW,
+        text_fill=COLOR_BLACK,
+        outline=None,
+        padding_x=18,
+        padding_y=8
+    )
+
+    titulo_social = limitar_texto(
+        titulo_social
+        or "Lo último de Internet",
+        78
+    )
+
+    lineas = envolver_texto(
+        draw,
+        titulo_social,
+        font_title,
+        920
+    )[:4]
+
+    y = PHOTO_H + 136
+    line_h = int(
+        title_size * 1.08
+    )
+
+    for i, linea in enumerate(
+        lineas
+    ):
+        draw.text(
+            (
+                68,
+                y + i * line_h
+            ),
+            linea,
+            font=font_title,
+            fill=COLOR_WHITE
+        )
+
+    # CTA muy discreta, lejos de la UI inferior de TikTok/Reels.
+    cta_y = H - 255
+
+    draw.rounded_rectangle(
+        (
+            68,
+            cta_y,
+            454,
+            cta_y + 58
+        ),
+        radius=29,
+        fill=COLOR_YELLOW
+    )
+
+    draw.text(
+        (
+            91,
+            cta_y + 18
+        ),
+        "MÁS CONTEXTO EN EL BLOG",
+        font=font_small,
+        fill=COLOR_BLACK
+    )
+
+    firma_y = H - 155
+
+    draw.text(
+        (
+            68,
+            firma_y
+        ),
+        "Miri",
+        font=font_brand,
+        fill=COLOR_WHITE
+    )
+
+    draw.rounded_rectangle(
+        (
+            195,
+            firma_y + 7,
+            401,
+            firma_y + 56
+        ),
+        radius=12,
+        fill=COLOR_RED
+    )
+
+    draw.text(
+        (
+            211,
+            firma_y + 21
+        ),
+        "te lo cuenta",
+        font=font_small,
+        fill=COLOR_WHITE
+    )
+
+    draw.text(
+        (
+            W - 260,
+            firma_y + 22
+        ),
+        "@miritelocuenta",
+        font=font_small,
+        fill=COLOR_LIGHT_GREY
+    )
+
+    canvas.save(
+        ruta_salida,
+        format="JPEG",
+        quality=92,
+        optimize=True
+    )
+
+    return ruta_salida
+
+
+def crear_video_estatico_social(
+    ruta_imagen_vertical,
+    ruta_salida=OUTPUT_SOCIAL_VIDEO,
+    segundos=SOCIAL_VIDEO_SECONDS
+):
+    """
+    Genera un MP4 vertical H.264 sin audio a partir de la imagen.
+    Primero intenta FFmpeg. Si no existe, no rompe el bot:
+    deja la imagen vertical lista y avisa.
+    """
+    asegurar_directorio_social()
+
+    ffmpeg = shutil.which(
+        "ffmpeg"
+    )
+
+    if not ffmpeg:
+        print(
+            "⚠️ No se encontró ffmpeg. "
+            "Se genera la imagen vertical, pero no el MP4."
+        )
+        return None
+
+    comando = [
+        ffmpeg,
+        "-y",
+        "-loop",
+        "1",
+        "-i",
+        ruta_imagen_vertical,
+        "-t",
+        str(segundos),
+        "-r",
+        "30",
+        "-vf",
+        "scale=1080:1920:force_original_aspect_ratio=decrease,"
+        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2,"
+        "format=yuv420p",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "20",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        ruta_salida,
+    ]
+
+    try:
+        proc = subprocess.run(
+            comando,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=90
+        )
+
+        if (
+            proc.returncode == 0
+            and os.path.exists(
+                ruta_salida
+            )
+            and os.path.getsize(
+                ruta_salida
+            ) > 0
+        ):
+            print(
+                "✅ Vídeo social 1080x1920 generado."
+            )
+            return ruta_salida
+
+        print(
+            "⚠️ FFmpeg no pudo crear el vídeo social."
+        )
+
+    except Exception as e:
+        print(
+            f"⚠️ Error creando vídeo social: {e}"
+        )
+
+    return None
+
+
+def construir_credito_texto_social(
+    info_imagen
+):
+    if not info_imagen:
+        return ""
+
+    title = (
+        info_imagen.get(
+            "title",
+            "Imagen"
+        )
+        or "Imagen"
+    ).strip()
+
+    artist = (
+        info_imagen.get(
+            "artist",
+            ""
+        )
+        or ""
+    ).strip()
+
+    license_name = (
+        info_imagen.get(
+            "license",
+            ""
+        )
+        or ""
+    ).strip()
+
+    source_name = (
+        "Wikimedia Commons"
+        if info_imagen.get(
+            "engine"
+        ) == "wikimedia"
+        else "Openverse"
+    )
+
+    piezas = [
+        f"Imagen: {title}"
+    ]
+
+    if artist:
+        piezas.append(
+            f"Autor: {artist}"
+        )
+
+    if source_name:
+        piezas.append(
+            source_name
+        )
+
+    if license_name:
+        piezas.append(
+            license_name
+        )
+
+    return " · ".join(
+        piezas
+    )
+
+
+def completar_copy_con_url(
+    texto,
+    url_articulo
+):
+    texto = (
+        texto
+        or ""
+    ).strip()
+
+    url_articulo = (
+        url_articulo
+        or ""
+    ).strip()
+
+    if "{URL}" in texto:
+        return texto.replace(
+            "{URL}",
+            url_articulo
+        )
+
+    if url_articulo:
+        return (
+            texto
+            + "\n\n"
+            + url_articulo
+        ).strip()
+
+    return texto
+
+
+def preparar_pack_social_final(
+    pack,
+    url_articulo,
+    info_imagen
+):
+    pack = dict(
+        pack
+        or {}
+    )
+
+    hashtags = normalizar_hashtags(
+        pack.get(
+            "hashtags",
+            []
+        )
+    )
+
+    hashtag_line = " ".join(
+        hashtags
+    )
+
+    credito = construir_credito_texto_social(
+        info_imagen
+    )
+
+    facebook = completar_copy_con_url(
+        pack.get(
+            "facebook",
+            ""
+        ),
+        url_articulo
+    )
+
+    instagram = (
+        pack.get(
+            "instagram",
+            ""
+        )
+        or ""
+    ).strip()
+
+    tiktok = (
+        pack.get(
+            "tiktok",
+            ""
+        )
+        or ""
+    ).replace(
+        "\n",
+        " "
+    ).strip()
+
+    youtube_desc = completar_copy_con_url(
+        pack.get(
+            "youtube_descripcion",
+            ""
+        ),
+        url_articulo
+    )
+
+    # Hashtags concretos al final.
+    if hashtag_line:
+        facebook = (
+            facebook
+            + "\n\n"
+            + hashtag_line
+        ).strip()
+
+        instagram = (
+            instagram
+            + "\n\n"
+            + hashtag_line
+        ).strip()
+
+        tiktok = (
+            tiktok
+            + " "
+            + hashtag_line
+        ).strip()
+
+        youtube_desc = (
+            youtube_desc
+            + "\n\n"
+            + hashtag_line
+        ).strip()
+
+    # Créditos en el copy para cumplir licencias BY/BY-SA.
+    if credito:
+        facebook = (
+            facebook
+            + "\n\n📷 "
+            + credito
+        ).strip()
+
+        instagram = (
+            instagram
+            + "\n\n📷 "
+            + credito
+        ).strip()
+
+        # TikTok: crédito compacto, en una sola línea.
+        tiktok = (
+            tiktok
+            + " 📷 "
+            + credito
+        ).strip()
+
+        youtube_desc = (
+            youtube_desc
+            + "\n\n📷 "
+            + credito
+        ).strip()
+
+    pack[
+        "facebook"
+    ] = facebook
+
+    pack[
+        "instagram"
+    ] = instagram
+
+    pack[
+        "tiktok"
+    ] = tiktok
+
+    pack[
+        "youtube_descripcion"
+    ] = youtube_desc
+
+    pack[
+        "url_articulo"
+    ] = url_articulo
+
+    pack[
+        "credito_imagen"
+    ] = credito
+
+    return pack
+
+
+def subir_activo_social_wordpress(
+    ruta_local
+):
+    """
+    Sube un activo social a la Biblioteca de Medios para que
+    tenga URL pública. Si WordPress rechaza un MP4 por el plan
+    o por límites de subida, el bot sigue funcionando.
+    """
+    if not (
+        ruta_local
+        and os.path.exists(
+            ruta_local
+        )
+        and WP_URL
+        and WP_USER
+        and WP_APP_PASS
+    ):
+        return None
+
+    mime = (
+        mimetypes.guess_type(
+            ruta_local
+        )[0]
+        or "application/octet-stream"
+    )
+
+    url_media = (
+        f"{WP_URL}/wp-json/wp/v2/media"
+    )
+
+    try:
+        with open(
+            ruta_local,
+            "rb"
+        ) as f:
+            data = f.read()
+
+        headers = {
+            "Content-Disposition": (
+                f'attachment; filename="'
+                f'{os.path.basename(ruta_local)}"'
+            ),
+            "Content-Type": mime,
+        }
+
+        r = requests.post(
+            url_media,
+            data=data,
+            headers=headers,
+            auth=(
+                WP_USER,
+                WP_APP_PASS
+            ),
+            timeout=60
+        )
+
+        if r.status_code in {
+            200,
+            201
+        }:
+            data = r.json()
+
+            return {
+                "id": data.get(
+                    "id"
+                ),
+                "url": data.get(
+                    "source_url"
+                ),
+                "mime": mime,
+            }
+
+        print(
+            "⚠️ WordPress no pudo subir activo social "
+            f"{os.path.basename(ruta_local)}: "
+            f"{r.status_code}"
+        )
+
+    except Exception as e:
+        print(
+            f"⚠️ Error subiendo activo social: {e}"
+        )
+
+    return None
+
+
+def guardar_pack_social(
+    pack,
+    rutas,
+    urls_media=None
+):
+    asegurar_directorio_social()
+
+    datos = dict(
+        pack
+        or {}
+    )
+
+    datos[
+        "archivos"
+    ] = {
+        "post_1080x1350": (
+            rutas.get(
+                "post"
+            )
+        ),
+        "vertical_1080x1920": (
+            rutas.get(
+                "vertical"
+            )
+        ),
+        "video_1080x1920": (
+            rutas.get(
+                "video"
+            )
+        ),
+    }
+
+    datos[
+        "media_wordpress"
+    ] = (
+        urls_media
+        or {}
+    )
+
+    datos[
+        "generado_en"
+    ] = datetime.now().isoformat(
+        timespec="seconds"
+    )
+
+    with open(
+        OUTPUT_SOCIAL_JSON,
+        "w",
+        encoding="utf-8"
+    ) as f:
+        json.dump(
+            datos,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+    texto = (
+        "=== MIRI TE LO CUENTA · PACK SOCIAL ===\n\n"
+        f"TÍTULO SOCIAL:\n{datos.get('titulo_social', '')}\n\n"
+        f"FACEBOOK:\n{datos.get('facebook', '')}\n\n"
+        f"INSTAGRAM:\n{datos.get('instagram', '')}\n\n"
+        f"TIKTOK:\n{datos.get('tiktok', '')}\n\n"
+        f"YOUTUBE SHORTS · TÍTULO:\n{datos.get('youtube_titulo', '')}\n\n"
+        f"YOUTUBE SHORTS · DESCRIPCIÓN:\n"
+        f"{datos.get('youtube_descripcion', '')}\n\n"
+        "KEYWORDS:\n"
+        + ", ".join(
+            datos.get(
+                "keywords_busqueda",
+                []
+            )
+        )
+        + "\n"
+    )
+
+    with open(
+        OUTPUT_SOCIAL_TXT,
+        "w",
+        encoding="utf-8"
+    ) as f:
+        f.write(
+            texto
+        )
+
+    print(
+        f"✅ Pack social guardado en {SOCIAL_OUTPUT_DIR}/"
+    )
+
+    return datos
+
+
+def generar_activos_sociales(
+    ruta_thumbnail,
+    titulo_social,
+    categoria_visual
+):
+    asegurar_directorio_social()
+
+    ruta_post = crear_social_post_1080x1350(
+        ruta_thumbnail,
+        titulo_social,
+        categoria_visual,
+        OUTPUT_SOCIAL_POST
+    )
+
+    ruta_vertical = crear_social_vertical_1080x1920(
+        ruta_thumbnail,
+        titulo_social,
+        categoria_visual,
+        OUTPUT_SOCIAL_VERTICAL
+    )
+
+    ruta_video = crear_video_estatico_social(
+        ruta_vertical,
+        OUTPUT_SOCIAL_VIDEO,
+        SOCIAL_VIDEO_SECONDS
+    )
+
+    return {
+        "post": ruta_post,
+        "vertical": ruta_vertical,
+        "video": ruta_video,
+    }
+
+
 # ==========================================
 # 20. WORDPRESS
 # ==========================================
@@ -3064,7 +4485,7 @@ def publicar_en_wordpress(
             f"Link: {post_data.get('link')}"
         )
 
-        return True
+        return post_data
 
     raise Exception(
         "❌ Error crítico al publicar entrada "
@@ -3148,6 +4569,21 @@ if __name__ == "__main__":
         f"🔎 Búsquedas imagen: {busquedas_imagen}"
     )
 
+    # Copies sociales: una segunda llamada breve a Gemini.
+    pack_social = generar_pack_social_gemini(
+        tema_viral=tema,
+        titulo_articulo=titulo,
+        contenido_html=contenido_html,
+        entidad_principal=entidad_principal,
+        contexto_visual=contexto_visual
+    )
+
+    print(
+        "📣 Título social: "
+        f"{pack_social.get('titulo_social')}"
+    )
+
+    # Miniatura del blog.
     ruta_imagen, info_imagen = generar_miniatura(
         titulo_miniatura=titulo_miniatura,
         categoria_visual=categoria_visual,
@@ -3157,6 +4593,18 @@ if __name__ == "__main__":
         busquedas_imagen=busquedas_imagen
     )
 
+    # Activos sociales derivados de la misma visual:
+    # 1080x1350 + 1080x1920 + MP4 vertical de 5 s.
+    rutas_sociales = generar_activos_sociales(
+        ruta_thumbnail=ruta_imagen,
+        titulo_social=pack_social.get(
+            "titulo_social",
+            titulo_miniatura
+        ),
+        categoria_visual=categoria_visual
+    )
+
+    # Crédito/licencia dentro del artículo.
     if info_imagen:
         credito = construir_credito_html(
             info_imagen
@@ -3166,13 +4614,74 @@ if __name__ == "__main__":
             contenido_html += credito
 
     if titulo and contenido_html:
-        publicado = publicar_en_wordpress(
+        post_data = publicar_en_wordpress(
             titulo,
             contenido_html,
             ruta_imagen
         )
 
-        if publicado:
+        if post_data:
+            url_articulo = (
+                post_data.get(
+                    "link"
+                )
+                or ""
+            )
+
+            # Completa URL + hashtags + crédito de imagen.
+            pack_social_final = preparar_pack_social_final(
+                pack=pack_social,
+                url_articulo=url_articulo,
+                info_imagen=info_imagen
+            )
+
+            # Sube también los activos sociales a WordPress Media.
+            # Si el plan no permite vídeo, falla solo ese archivo.
+            media_urls = {}
+
+            for clave, ruta in rutas_sociales.items():
+                if not ruta:
+                    continue
+
+                subido = subir_activo_social_wordpress(
+                    ruta
+                )
+
+                if subido:
+                    media_urls[
+                        clave
+                    ] = subido
+
+            guardar_pack_social(
+                pack=pack_social_final,
+                rutas=rutas_sociales,
+                urls_media=media_urls
+            )
+
+            print(
+                "📦 Archivos creados:"
+            )
+            print(
+                f"   - {OUTPUT_SOCIAL_POST}"
+            )
+            print(
+                f"   - {OUTPUT_SOCIAL_VERTICAL}"
+            )
+
+            if rutas_sociales.get(
+                "video"
+            ):
+                print(
+                    f"   - {OUTPUT_SOCIAL_VIDEO}"
+                )
+
+            print(
+                f"   - {OUTPUT_SOCIAL_JSON}"
+            )
+            print(
+                f"   - {OUTPUT_SOCIAL_TXT}"
+            )
+
             guardar_en_historial(
                 tema
             )
