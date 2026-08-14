@@ -6,7 +6,9 @@ import html
 import re
 import base64
 import mimetypes
+import unicodedata
 import xml.etree.ElementTree as ET
+from io import BytesIO
 
 # ==========================================
 # 1. VARIABLES DE ENTORNO
@@ -58,6 +60,22 @@ CATEGORIAS_VALIDAS = {
     "REALITY",
     "VIRAL",
     "INTERNET",
+}
+
+TIPOS_VISUALES_VALIDOS = {
+    "persona",
+    "programa",
+    "marca",
+    "evento",
+    "tema",
+}
+
+UMBRAL_SCORE = {
+    "persona": 72,
+    "programa": 58,
+    "marca": 58,
+    "evento": 52,
+    "tema": 42,
 }
 
 
@@ -180,10 +198,34 @@ def normalizar_categoria(categoria):
     return categoria
 
 
+def normalizar_tipo_visual(tipo_visual):
+    tipo = (tipo_visual or "").strip().lower()
+
+    equivalencias = {
+        "person": "persona",
+        "celebridad": "persona",
+        "personaje": "persona",
+        "tv": "programa",
+        "reality": "programa",
+        "show": "programa",
+        "brand": "marca",
+        "event": "evento",
+        "topic": "tema",
+        "concepto": "tema",
+    }
+
+    tipo = equivalencias.get(tipo, tipo)
+
+    if tipo not in TIPOS_VISUALES_VALIDOS:
+        tipo = "tema"
+
+    return tipo
+
+
 def generar_articulo_miri(tema_viral):
     modelos = obtener_modelos_disponibles()
 
-    prompt = f'''
+    prompt = f"""
 Eres la redactora principal del portal de actualidad, entretenimiento
 y cultura de Internet "Miri te lo cuenta".
 
@@ -199,7 +241,14 @@ La estructura debe ser exactamente:
   "contenido_html": "<p>Primer párrafo...</p><p>Segundo párrafo...</p>",
   "titulo_miniatura": "TITULAR MUY CORTO PARA LA IMAGEN",
   "categoria_visual": "UNA CATEGORÍA DE LA LISTA",
-  "busqueda_imagen": "persona, programa, plataforma o tema visual principal"
+  "tipo_visual": "persona | programa | marca | evento | tema",
+  "entidad_principal": "nombre exacto de la persona, programa, marca, evento o tema",
+  "contexto_visual": "2-6 palabras que ayuden a distinguir la entidad",
+  "busquedas_imagen": [
+    "búsqueda exacta 1",
+    "búsqueda exacta 2",
+    "búsqueda exacta 3"
+  ]
 }}
 
 REGLAS PARA titulo_miniatura:
@@ -221,13 +270,28 @@ Escoge SOLO UNA de estas:
 - VIRAL
 - INTERNET
 
-REGLAS PARA busqueda_imagen:
-- NO escribas una frase genérica como "news party".
-- Si hay una persona conocida, usa su nombre exacto.
-- Si hay un programa, reality o plataforma, usa su nombre exacto.
-- Si no hay persona concreta, usa 2-5 palabras del tema visual principal.
-- Puede estar en español o inglés.
-'''
+REGLAS PARA tipo_visual:
+- "persona" si la noticia trata principalmente sobre una persona concreta.
+- "programa" si el sujeto principal es un programa, reality, serie o formato.
+- "marca" si la entidad principal es una empresa, plataforma o marca.
+- "evento" si la noticia gira alrededor de un evento concreto.
+- "tema" si no hay una entidad concreta.
+
+REGLAS PARA entidad_principal:
+- Si es persona, escribe su nombre completo exacto.
+- Si es programa/marca/evento, escribe el nombre exacto.
+- No metas descripciones aquí.
+
+REGLAS PARA contexto_visual:
+- Debe ayudar a evitar homónimos o resultados irrelevantes.
+- Ejemplos: "skateboard Spain", "Telecinco reality", "TikTok social media".
+
+REGLAS PARA busquedas_imagen:
+- Devuelve 3 búsquedas.
+- Si es persona, TODAS deben incluir el nombre exacto y añadir contexto.
+- Si es programa/marca/evento, TODAS deben incluir el nombre exacto.
+- No uses búsquedas genéricas tipo "news party".
+"""
 
     headers = {"Content-Type": "application/json"}
 
@@ -286,16 +350,50 @@ REGLAS PARA busqueda_imagen:
                     articulo.get("categoria_visual")
                 )
 
-                busqueda_imagen = html.unescape(
-                    articulo.get("busqueda_imagen") or tema_viral
+                tipo_visual = normalizar_tipo_visual(
+                    articulo.get("tipo_visual")
+                )
+
+                entidad_principal = html.unescape(
+                    articulo.get("entidad_principal") or ""
                 ).strip()
+
+                contexto_visual = html.unescape(
+                    articulo.get("contexto_visual") or ""
+                ).strip()
+
+                busquedas_imagen = articulo.get("busquedas_imagen") or []
+
+                if not isinstance(busquedas_imagen, list):
+                    busquedas_imagen = [str(busquedas_imagen)]
+
+                busquedas_imagen = [
+                    html.unescape(str(q)).strip()
+                    for q in busquedas_imagen
+                    if str(q).strip()
+                ]
+
+                base = " ".join(
+                    x for x in [entidad_principal, contexto_visual] if x
+                ).strip()
+
+                if base and base not in busquedas_imagen:
+                    busquedas_imagen.append(base)
+
+                if entidad_principal and entidad_principal not in busquedas_imagen:
+                    busquedas_imagen.append(entidad_principal)
+
+                busquedas_imagen = busquedas_imagen[:5]
 
                 return (
                     titulo,
                     contenido_html,
                     titulo_miniatura,
                     categoria_visual,
-                    busqueda_imagen
+                    tipo_visual,
+                    entidad_principal,
+                    contexto_visual,
+                    busquedas_imagen
                 )
 
         except Exception as e:
@@ -318,6 +416,68 @@ def quitar_html(texto):
     texto = html.unescape(texto)
     texto = re.sub(r"\s+", " ", texto).strip()
     return texto
+
+
+def normalizar_texto(texto):
+    texto = quitar_html(texto).lower().strip()
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(
+        c for c in texto
+        if not unicodedata.combining(c)
+    )
+    texto = re.sub(r"[^a-z0-9\s]", " ", texto)
+    texto = re.sub(r"\s+", " ", texto).strip()
+    return texto
+
+
+def tokens_significativos(texto):
+    stop = {
+        "de", "del", "la", "las", "el", "los", "y", "en",
+        "the", "of", "and", "a", "an", "for", "to", "on",
+        "con", "por", "para", "un", "una"
+    }
+
+    return [
+        t for t in normalizar_texto(texto).split()
+        if len(t) >= 3 and t not in stop
+    ]
+
+
+def cobertura_tokens(objetivo, texto):
+    objetivo_tokens = tokens_significativos(objetivo)
+
+    if not objetivo_tokens:
+        return 0.0
+
+    texto_norm = set(tokens_significativos(texto))
+
+    coincidencias = sum(
+        1 for t in objetivo_tokens
+        if t in texto_norm
+    )
+
+    return coincidencias / len(objetivo_tokens)
+
+
+def metadatos_candidato(candidato):
+    return " ".join([
+        candidato.get("title") or "",
+        candidato.get("description") or "",
+        candidato.get("author") or "",
+        candidato.get("source") or "",
+        candidato.get("page_url") or "",
+        candidato.get("query") or "",
+    ])
+
+
+def contiene_entidad_exacta(entidad, candidato):
+    entidad_norm = normalizar_texto(entidad)
+    meta_norm = normalizar_texto(metadatos_candidato(candidato))
+
+    if not entidad_norm:
+        return False
+
+    return entidad_norm in meta_norm
 
 
 def licencia_wikimedia_permitida(licencia):
@@ -345,13 +505,15 @@ def licencia_wikimedia_permitida(licencia):
     return any(x in texto for x in permitidas)
 
 
-def buscar_imagen_openverse(busqueda):
-    print(f"🔎 Buscando imagen en Openverse: {busqueda}")
+def buscar_candidatos_openverse(busqueda, limite=12):
+    print(f"🔎 Openverse: {busqueda}")
 
     params = {
         "q": busqueda,
-        "page_size": 20,
+        "page_size": min(limite, 20),
     }
+
+    candidatos = []
 
     try:
         res = requests.get(
@@ -362,11 +524,8 @@ def buscar_imagen_openverse(busqueda):
         )
 
         if res.status_code != 200:
-            print(
-                f"⚠️ Openverse respondió {res.status_code}. "
-                "Probando Wikimedia..."
-            )
-            return None
+            print(f"⚠️ Openverse respondió {res.status_code}.")
+            return []
 
         resultados = res.json().get("results", [])
 
@@ -387,7 +546,7 @@ def buscar_imagen_openverse(busqueda):
             if not (url_principal or url_fallback):
                 continue
 
-            return {
+            candidatos.append({
                 "url": url_principal or url_fallback,
                 "url_fallback": url_fallback,
                 "author": autor or "Dominio público",
@@ -404,16 +563,20 @@ def buscar_imagen_openverse(busqueda):
                     or ""
                 ),
                 "title": item.get("title") or "",
-            }
+                "description": item.get("description") or "",
+                "width": item.get("width") or 0,
+                "height": item.get("height") or 0,
+                "query": busqueda,
+            })
 
     except Exception as e:
         print(f"⚠️ Error buscando en Openverse: {e}")
 
-    return None
+    return candidatos
 
 
-def buscar_imagen_wikimedia(busqueda):
-    print(f"🔎 Buscando imagen en Wikimedia Commons: {busqueda}")
+def buscar_candidatos_wikimedia(busqueda, limite=12):
+    print(f"🔎 Wikimedia: {busqueda}")
 
     params = {
         "action": "query",
@@ -421,11 +584,13 @@ def buscar_imagen_wikimedia(busqueda):
         "generator": "search",
         "gsrsearch": busqueda,
         "gsrnamespace": 6,
-        "gsrlimit": 20,
+        "gsrlimit": min(limite, 20),
         "prop": "imageinfo",
-        "iiprop": "url|extmetadata",
+        "iiprop": "url|extmetadata|size",
         "iiurlwidth": 1600,
     }
+
+    candidatos = []
 
     try:
         res = requests.get(
@@ -437,7 +602,7 @@ def buscar_imagen_wikimedia(busqueda):
 
         if res.status_code != 200:
             print(f"⚠️ Wikimedia respondió {res.status_code}.")
-            return None
+            return []
 
         pages = res.json().get("query", {}).get("pages", {})
 
@@ -473,11 +638,15 @@ def buscar_imagen_wikimedia(busqueda):
             if not url_principal:
                 continue
 
+            descripcion = quitar_html(
+                (meta.get("ImageDescription") or {}).get("value")
+            )
+
             licencia_url = quitar_html(
                 (meta.get("LicenseUrl") or {}).get("value")
             )
 
-            return {
+            candidatos.append({
                 "url": url_principal,
                 "url_fallback": url_fallback,
                 "author": autor or "Wikimedia Commons",
@@ -486,38 +655,114 @@ def buscar_imagen_wikimedia(busqueda):
                 "source": "Wikimedia Commons",
                 "page_url": info.get("descriptionurl") or "",
                 "title": page.get("title") or "",
-            }
+                "description": descripcion,
+                "width": info.get("thumbwidth") or info.get("width") or 0,
+                "height": info.get("thumbheight") or info.get("height") or 0,
+                "query": busqueda,
+            })
 
     except Exception as e:
         print(f"⚠️ Error buscando en Wikimedia: {e}")
 
-    return None
+    return candidatos
 
 
-def buscar_imagen_abierta(busqueda):
-    imagen = buscar_imagen_openverse(busqueda)
+def recolectar_candidatos(tipo_visual, busquedas_imagen):
+    todos = []
 
-    if imagen:
-        print(
-            f"✅ Imagen encontrada en {imagen.get('source')}: "
-            f"{imagen.get('title') or 'sin título'}"
+    for busqueda in busquedas_imagen:
+        if tipo_visual in {"persona", "programa", "marca", "evento"}:
+            todos.extend(buscar_candidatos_wikimedia(busqueda))
+            todos.extend(buscar_candidatos_openverse(busqueda))
+        else:
+            todos.extend(buscar_candidatos_openverse(busqueda))
+            todos.extend(buscar_candidatos_wikimedia(busqueda))
+
+    vistos = set()
+    unicos = []
+
+    for c in todos:
+        clave = (
+            c.get("page_url")
+            or c.get("url")
+            or c.get("title")
         )
-        return imagen
 
-    imagen = buscar_imagen_wikimedia(busqueda)
+        if not clave or clave in vistos:
+            continue
 
-    if imagen:
-        print(
-            f"✅ Imagen encontrada en Wikimedia Commons: "
-            f"{imagen.get('title') or 'sin título'}"
-        )
-        return imagen
+        vistos.add(clave)
+        unicos.append(c)
 
-    print(
-        "⚠️ No se encontró una imagen abierta adecuada. "
-        "Se usará el fondo gráfico de marca."
+    return unicos
+
+
+def puntuar_candidato(
+    candidato,
+    tipo_visual,
+    entidad_principal,
+    contexto_visual
+):
+    score = 0
+    meta = metadatos_candidato(candidato)
+    meta_norm = normalizar_texto(meta)
+
+    entidad_norm = normalizar_texto(entidad_principal)
+    cobertura_entidad = cobertura_tokens(
+        entidad_principal,
+        meta
     )
-    return None
+
+    cobertura_contexto = cobertura_tokens(
+        contexto_visual,
+        meta
+    )
+
+    if entidad_norm and entidad_norm in meta_norm:
+        score += 55
+    else:
+        score += int(cobertura_entidad * 35)
+
+    score += int(cobertura_contexto * 20)
+
+    if candidato.get("source") == "Wikimedia Commons":
+        score += 7
+
+    width = int(candidato.get("width") or 0)
+    height = int(candidato.get("height") or 0)
+
+    if width >= 1000 and height >= 600:
+        score += 10
+    elif width >= 700 and height >= 400:
+        score += 5
+    elif width and height and (width < 500 or height < 300):
+        score -= 15
+
+    palabras_grupo = {
+        "group", "family", "team", "friends", "crowd",
+        "grupo", "familia", "equipo", "amigos", "multitud",
+        "cast", "reparto",
+    }
+
+    if tipo_visual == "persona":
+        if any(p in meta_norm.split() for p in palabras_grupo):
+            score -= 18
+
+        # Regla crítica:
+        # para una persona no aceptamos una imagen si sus metadatos
+        # no contienen de forma suficientemente clara el nombre.
+        if entidad_principal:
+            if not contiene_entidad_exacta(entidad_principal, candidato):
+                if cobertura_entidad < 0.75:
+                    return -999
+
+    elif tipo_visual in {"programa", "marca", "evento"}:
+        if entidad_principal:
+            if not contiene_entidad_exacta(entidad_principal, candidato):
+                if cobertura_entidad < 0.60:
+                    score -= 35
+
+    return score
 
 
 def descargar_imagen_bytes(url):
@@ -555,30 +800,162 @@ def descargar_imagen_bytes(url):
         return None, None
 
 
-def imagen_a_data_uri(info_imagen):
-    if not info_imagen:
+def analizar_imagen_bytes(data):
+    resultado = {
+        "width": 0,
+        "height": 0,
+        "casi_monocroma": False,
+    }
+
+    if not data:
+        return resultado
+
+    try:
+        from PIL import Image, ImageStat
+
+        img = Image.open(BytesIO(data)).convert("RGB")
+        resultado["width"], resultado["height"] = img.size
+
+        muestra = img.copy()
+        muestra.thumbnail((240, 240))
+
+        stat = ImageStat.Stat(muestra)
+        r, g, b = stat.mean[:3]
+        diferencia_medias = max(r, g, b) - min(r, g, b)
+
+        pixeles = list(muestra.getdata())
+
+        if pixeles:
+            dif_media = sum(
+                max(px) - min(px)
+                for px in pixeles
+            ) / len(pixeles)
+        else:
+            dif_media = 0
+
+        resultado["casi_monocroma"] = (
+            diferencia_medias < 10
+            and dif_media < 16
+        )
+
+    except Exception:
+        # Pillow es opcional. Si no está, no bloqueamos el bot.
+        pass
+
+    return resultado
+
+
+def convertir_a_data_uri(data, mime):
+    if not data or not mime:
         return None
 
-    urls = [
-        info_imagen.get("url"),
-        info_imagen.get("url_fallback"),
-    ]
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
 
-    urls_probadas = set()
 
-    for url in urls:
-        if not url or url in urls_probadas:
+def seleccionar_mejor_imagen(
+    tipo_visual,
+    entidad_principal,
+    contexto_visual,
+    busquedas_imagen
+):
+    candidatos = recolectar_candidatos(
+        tipo_visual,
+        busquedas_imagen
+    )
+
+    if not candidatos:
+        print("⚠️ No hay candidatos de imagen.")
+        return None, None
+
+    puntuados = []
+
+    for candidato in candidatos:
+        score = puntuar_candidato(
+            candidato,
+            tipo_visual,
+            entidad_principal,
+            contexto_visual
+        )
+
+        if score <= -900:
             continue
 
-        urls_probadas.add(url)
+        candidato["score_metadata"] = score
+        puntuados.append(candidato)
 
-        data, mime = descargar_imagen_bytes(url)
+    puntuados.sort(
+        key=lambda x: x.get("score_metadata", 0),
+        reverse=True
+    )
 
-        if data and mime:
-            encoded = base64.b64encode(data).decode("ascii")
-            return f"data:{mime};base64,{encoded}"
+    for candidato in puntuados[:8]:
+        data = None
+        mime = None
 
-    return None
+        for url in [
+            candidato.get("url"),
+            candidato.get("url_fallback")
+        ]:
+            if not url:
+                continue
+
+            data, mime = descargar_imagen_bytes(url)
+
+            if data and mime:
+                break
+
+        if not data:
+            continue
+
+        analisis = analizar_imagen_bytes(data)
+        score = candidato.get("score_metadata", 0)
+
+        ancho_real = analisis.get("width") or 0
+        alto_real = analisis.get("height") or 0
+
+        if ancho_real >= 1000 and alto_real >= 600:
+            score += 8
+        elif ancho_real and alto_real and (
+            ancho_real < 500 or alto_real < 300
+        ):
+            score -= 20
+
+        if analisis.get("casi_monocroma"):
+            score -= 25
+            candidato["es_monocroma"] = True
+        else:
+            candidato["es_monocroma"] = False
+            score += 5
+
+        candidato["score_final"] = score
+        candidato["width_real"] = ancho_real
+        candidato["height_real"] = alto_real
+
+        umbral = UMBRAL_SCORE.get(tipo_visual, 42)
+
+        print(
+            f"🧪 Candidato: {candidato.get('title') or 'sin título'} "
+            f"| score={score} | fuente={candidato.get('source')} "
+            f"| monocroma={candidato.get('es_monocroma')}"
+        )
+
+        if score >= umbral:
+            data_uri = convertir_a_data_uri(data, mime)
+
+            if data_uri:
+                print(
+                    f"✅ Imagen seleccionada con score {score}: "
+                    f"{candidato.get('title') or candidato.get('source')}"
+                )
+                return candidato, data_uri
+
+    print(
+        "⚠️ Ninguna imagen superó el umbral de relevancia/calidad. "
+        "Se usará el fondo gráfico de marca."
+    )
+
+    return None, None
 
 
 def calcular_font_size(titulo):
@@ -1083,7 +1460,10 @@ def renderizar_html_a_png(html_doc, ruta_salida):
 def generar_miniatura_html(
     titulo_miniatura,
     categoria_visual,
-    busqueda_imagen
+    tipo_visual,
+    entidad_principal,
+    contexto_visual,
+    busquedas_imagen
 ):
     ruta_local = "miniatura_destacada.png"
 
@@ -1094,30 +1474,24 @@ def generar_miniatura_html(
             pass
 
     print("🎨 Preparando miniatura de Miri te lo cuenta...")
-    print(f"🔍 Búsqueda visual: {busqueda_imagen}")
+    print(f"🧩 Tipo visual: {tipo_visual}")
+    print(f"🎯 Entidad principal: {entidad_principal}")
+    print(f"🧭 Contexto visual: {contexto_visual}")
+    print(f"🔍 Búsquedas: {busquedas_imagen}")
 
-    info_imagen = buscar_imagen_abierta(
-        busqueda_imagen
-    )
-
-    image_data_uri = imagen_a_data_uri(
-        info_imagen
+    info_imagen, image_data_uri = seleccionar_mejor_imagen(
+        tipo_visual=tipo_visual,
+        entidad_principal=entidad_principal,
+        contexto_visual=contexto_visual,
+        busquedas_imagen=busquedas_imagen
     )
 
     if info_imagen and image_data_uri:
-        print(
-            "✅ La imagen de fondo se ha descargado "
-            "y embebido correctamente."
-        )
-    elif info_imagen and not image_data_uri:
-        print(
-            "⚠️ Se encontró una imagen, pero no se pudo "
-            "descargar. Se usará el fondo gráfico de marca."
-        )
-        info_imagen = None
+        print("✅ Se usará una imagen validada por relevancia.")
     else:
         print(
-            "ℹ️ Se generará una miniatura gráfica sin foto."
+            "ℹ️ Se usará el fondo gráfico de marca porque "
+            "no hay una imagen suficientemente fiable."
         )
 
     html_doc = crear_html_miniatura(
@@ -1309,18 +1683,27 @@ if __name__ == "__main__":
         contenido_html,
         titulo_miniatura,
         categoria_visual,
-        busqueda_imagen
+        tipo_visual,
+        entidad_principal,
+        contexto_visual,
+        busquedas_imagen
     ) = generar_articulo_miri(tema)
 
     print(f"📰 Título artículo: {titulo}")
     print(f"🖼️ Título miniatura: {titulo_miniatura}")
     print(f"🏷️ Categoría visual: {categoria_visual}")
-    print(f"🔎 Búsqueda imagen: {busqueda_imagen}")
+    print(f"🧩 Tipo visual: {tipo_visual}")
+    print(f"🎯 Entidad principal: {entidad_principal}")
+    print(f"🧭 Contexto visual: {contexto_visual}")
+    print(f"🔎 Búsquedas imagen: {busquedas_imagen}")
 
     ruta_imagen, info_imagen = generar_miniatura_html(
-        titulo_miniatura,
-        categoria_visual,
-        busqueda_imagen
+        titulo_miniatura=titulo_miniatura,
+        categoria_visual=categoria_visual,
+        tipo_visual=tipo_visual,
+        entidad_principal=entidad_principal,
+        contexto_visual=contexto_visual,
+        busquedas_imagen=busquedas_imagen
     )
 
     if info_imagen:
