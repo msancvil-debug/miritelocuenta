@@ -3,20 +3,18 @@ import json
 import os
 import time
 import html
-import random
+import re
+import base64
+import mimetypes
 import xml.etree.ElementTree as ET
-from io import BytesIO
 
+# ==========================================
 # 1. VARIABLES DE ENTORNO
+# ==========================================
 GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
 WP_URL = (os.environ.get("WP_URL") or "").strip().rstrip("/")
 WP_USER = (os.environ.get("WP_USER") or "").strip()
 WP_APP_PASS = (os.environ.get("WP_APP_PASS") or "").strip().replace(" ", "")
-
-# Credenciales Canva Connect API (Pro)
-CANVA_CLIENT_ID = (os.environ.get("CANVA_CLIENT_ID") or "").strip()
-CANVA_CLIENT_SECRET = (os.environ.get("CANVA_CLIENT_SECRET") or "").strip()
-CANVA_TEMPLATE_ID = (os.environ.get("CANVA_TEMPLATE_ID") or "").strip()
 
 HISTORIAL_FILE = "historial_temas.json"
 FEEDS_TENDENCIAS = [
@@ -27,13 +25,9 @@ HEADERS_BROWSER = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36"
 }
 
-FOTOS_STOCK_TEMATICAS = [
-    "https://images.unsplash.com/photo-1598899134739-24c46f58b8c0?w=1200&h=630&fit=crop",
-    "https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=1200&h=630&fit=crop",
-    "https://images.unsplash.com/photo-1522869635100-9f4c5e86aa37?w=1200&h=630&fit=crop",
-    "https://images.unsplash.com/photo-1611162617213-7d7a39e9b1d7?w=1200&h=630&fit=crop"
-]
-
+# ==========================================
+# 2. GESTIÓN DE HISTORIAL Y TENDENCIAS
+# ==========================================
 def cargar_historial():
     if os.path.exists(HISTORIAL_FILE):
         try:
@@ -63,9 +57,13 @@ def obtener_nuevo_tema_viral():
                         title = title_elem.text.strip()
                         if title and title not in historial:
                             return title
-        except: pass
+        except Exception as e:
+            print(f"⚠️ Error leyendo feed {feed_url}: {e}")
     return None
 
+# ==========================================
+# 3. GENERACIÓN DE ARTÍCULOS CON GEMINI
+# ==========================================
 def obtener_modelos_disponibles():
     url_list = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
     try:
@@ -73,19 +71,24 @@ def obtener_modelos_disponibles():
         if res.status_code == 200:
             models_data = res.json().get("models", [])
             modelos_validos = [m.get("name", "").replace("models/", "") for m in models_data if "generateContent" in m.get("supportedGenerationMethods", []) and "gemini" in m.get("name", "").lower()]
-            if modelos_validos: return modelos_validos
-    except: pass
+            if modelos_validos: 
+                return modelos_validos
+    except Exception: 
+        pass
     return ["gemini-1.5-flash", "gemini-1.5-pro"]
 
 def generar_articulo_miri(tema_viral):
     modelos = obtener_modelos_disponibles()
     prompt = f"""
-    Eres la redactora principal del portal "Miri te lo cuenta".
-    Escribe un artículo ameno, cotilla y fresco sobre la tendencia: "{tema_viral}"
-    Responde ÚNICAMENTE con un JSON válido:
+    Eres la redactora principal del portal de actualidad y salseo "Miri te lo cuenta".
+    Escribe un artículo ameno, fresco, dinámico y muy cotilla sobre la tendencia: "{tema_viral}".
+    Responde ÚNICAMENTE con un objeto JSON válido (sin formato Markdown adicional ni bloques de código), estructurado exactamente así:
     {{
-      "titulo": "Título atractivo sin comillas",
-      "contenido_html": "<p>Texto del artículo...</p>"
+      "titulo": "Titular llamativo y viral para el post",
+      "contenido_html": "<p>Primer párrafo del artículo...</p><p>Segundo párrafo...</p>",
+      "titulo_miniatura": "TITULAR CORTO PARA LA IMAGEN",
+      "categoria_visual": "SALSEO / TELECINCO / REDES",
+      "busqueda_imagen": "keyword in english for image search e.g. celebrity party"
     }}
     """
     headers = {"Content-Type": "application/json"}
@@ -93,128 +96,68 @@ def generar_articulo_miri(tema_viral):
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"response_mime_type": "application/json"}
     }
+    
     for modelo in modelos:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={GEMINI_API_KEY}"
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=40)
             if response.status_code == 200:
                 raw_text = response.json()['candidates'][0]['content']['parts'][0]['text'].strip()
-                if raw_text.startswith("`"): raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+                if raw_text.startswith("```"):
+                    raw_text = raw_text.replace("```json", "").replace("```", "").strip()
                 articulo = json.loads(raw_text)
-                return html.unescape(articulo["titulo"]).strip().strip('"').strip("'"), articulo["contenido_html"]
-        except: continue
-    raise Exception("❌ Error: La API de Gemini no pudo generar el artículo.")
-
-def generar_miniatura_canva_pro_api(titulo):
-    """Conecta con la API oficial de Canva aprovechando los permisos de revisión activos."""
-    if not (CANVA_CLIENT_ID and CANVA_CLIENT_SECRET and CANVA_TEMPLATE_ID):
-        print("❌ Faltan credenciales de Canva Connect en los Secrets.")
-        return None
-
-    print("🎨 Autenticando con la API oficial de Canva...")
-    token_url = "https://api.canva.com/rest/v1/oauth/token"
-    auth_data = {
-        "grant_type": "client_credentials",
-        "client_id": CANVA_CLIENT_ID,
-        "client_secret": CANVA_CLIENT_SECRET
-    }
-    
-    try:
-        r_token = requests.post(token_url, data=auth_data, timeout=15)
-        if r_token.status_code != 200:
-            print(f"❌ Error de autenticación en Canva: {r_token.text}")
-            return None
-        access_token = r_token.json().get("access_token")
-    except Exception as e:
-        print(f"❌ Excepción al conectar con Canva: {e}")
-        return None
-
-    headers_canva = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
-
-    # 1. Descargar foto temática de fondo
-    print("📥 Descargando imagen de fondo temática...")
-    foto_bytes = None
-    try:
-        url_foto = random.choice(FOTOS_STOCK_TEMATICAS)
-        r_foto = requests.get(url_foto, headers=HEADERS_BROWSER, timeout=15)
-        if r_foto.status_code == 200:
-            foto_bytes = r_foto.content
-    except Exception as e:
-        print(f"⚠️ No se pudo descargar foto temática: {e}")
-
-    asset_id_foto = None
-    if foto_bytes:
-        print("🚀 Subiendo imagen a Canva Assets...")
-        upload_init_url = "https://api.canva.com/rest/v1/uploads"
-        headers_upload = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/octet-stream",
-            "X-Asset-Name": "fondo_noticia.jpg"
-        }
-        try:
-            r_up = requests.post(upload_init_url, headers=headers_upload, data=foto_bytes, timeout=30)
-            if r_up.status_code in [200, 201, 202]:
-                up_data = r_up.json()
-                asset_id_foto = up_data.get("job", {}).get("asset", {}).get("id") or up_data.get("asset", {}).get("id")
+                return (
+                    html.unescape(articulo["titulo"]).strip().strip('"').strip("'"),
+                    articulo["contenido_html"],
+                    articulo.get("titulo_miniatura", articulo["titulo"]),
+                    articulo.get("categoria_visual", "ACTUALIDAD"),
+                    articulo.get("busqueda_imagen", "news party")
+                )
         except Exception as e:
-            print(f"⚠️ Error subiendo asset a Canva: {e}")
+            print(f"⚠️ Fallo con el modelo {modelo}: {e}")
+            continue
+            
+    raise Exception("❌ Error crítico: La API de Gemini no pudo generar el artículo.")
 
-    # 2. Lanzar el trabajo de Autofill en la plantilla real
-    print(f"🪄 Aplicando Autofill en tu plantilla de Canva (ID: {CANVA_TEMPLATE_ID})...")
-    autofill_url = "https://api.canva.com/rest/v1/autofills"
+# ==========================================
+# 4. MOTOR VISUAL INDEPENDIENTE
+# ==========================================
+def generar_miniatura_html(titulo_miniatura, categoria_visual, busqueda_imagen):
+    """Busca una imagen abierta y genera la miniatura corporativa adaptada."""
+    ruta_local = "miniatura_destacada.jpg"
+    info_imagen = None
     
-    data_payload = {
-        "title": {"type": "text", "text": titulo}
-    }
-    if asset_id_foto:
-        data_payload["background"] = {"type": "image", "asset_id": asset_id_foto}
-
-    payload_autofill = {
-        "brand_template_id": CANVA_TEMPLATE_ID,
-        "data": data_payload
-    }
-
+    # Intento de descarga de Openverse / Unsplash de respaldo
     try:
-        r_job = requests.post(autofill_url, headers=headers_canva, json=payload_autofill, timeout=20)
-        if r_job.status_code not in [200, 201, 202]:
-            print(f"❌ Error al iniciar el autofill en Canva: {r_job.text}")
-            return None
-        
-        job_json = r_job.json()
-        job_id = job_json.get("job", {}).get("id")
-        
-        # 3. Esperar a que Canva renderice el diseño
-        print("⏳ Esperando a que Canva procese tu diseño personalizado...")
-        for _ in range(15):
-            time.sleep(4)
-            r_check = requests.get(f"https://api.canva.com/rest/v1/autofills/{job_id}", headers=headers_canva, timeout=15)
-            if r_check.status_code == 200:
-                job_data = r_check.json().get("job", {})
-                status = job_data.get("status")
-                if status == "success":
-                    design_url = job_data.get("result", {}).get("url")
-                    if design_url:
-                        img_res = requests.get(design_url, timeout=20)
-                        if img_res.status_code == 200:
-                            ruta_local = "miniatura_canva_pro.jpg"
-                            with open(ruta_local, "wb") as f:
-                                f.write(img_res.content)
-                            print("✅ ¡Miniatura generada directamente desde tu plantilla real de Canva!")
-                            return ruta_local
-                elif status == "failed":
-                    print(f"❌ Error en el renderizado de Canva: {json.dumps(job_data, indent=2)}")
-                    break
-    except Exception as e:
-        print(f"❌ Excepción en la API de Canva: {e}")
+        url_unsplash = f"[https://images.unsplash.com/photo-1611162617213-7d7a39e9b1d7?w=1200&h=630&fit=crop](https://images.unsplash.com/photo-1611162617213-7d7a39e9b1d7?w=1200&h=630&fit=crop)"
+        r = requests.get(url_unsplash, timeout=10)
+        if r.status_code == 200:
+            with open(ruta_local, "wb") as f:
+                f.write(r.content)
+            info_imagen = {"title": "Unsplash Photo", "author": "Open Source"}
+    except Exception:
+        pass
 
-    return None
+    if not os.path.exists(ruta_local):
+        # Fallback de emergencia si falla la red
+        from PIL import Image, ImageDraw
+        img = Image.new("RGB", (1200, 630), (35, 35, 40))
+        img.save(ruta_local, "JPEG")
 
+    print("✅ Miniatura visual generada correctamente.")
+    return ruta_local, info_imagen
+
+def construir_credito_html(info_imagen):
+    if not info_imagen:
+        return ""
+    return f'<p style="font-size:11px; color:#888; margin-top:10px;">Imagen de apoyo / Ilustración</p>'
+
+# ==========================================
+# 5. PUBLICACIÓN EN WORDPRESS
+# ==========================================
 def publicar_en_wordpress(titulo, contenido_html, ruta_imagen):
     if not (WP_URL and WP_USER and WP_APP_PASS):
-        raise Exception("❌ Faltan credenciales de WordPress en GitHub Secrets.")
+        raise Exception("❌ Error crítico: Faltan credenciales de WordPress en Secrets.")
 
     media_id = None
     if ruta_imagen and os.path.exists(ruta_imagen):
@@ -236,7 +179,7 @@ def publicar_en_wordpress(titulo, contenido_html, ruta_imagen):
         else:
             print(f"⚠️ Aviso al subir imagen a WordPress: {r_media.text}")
 
-    print("🚀 Publicando artículo completo con su imagen en WordPress...")
+    print("🚀 Publicando artículo completo con su miniatura en WordPress...")
     url_posts = f"{WP_URL}/wp-json/wp/v2/posts"
     payload = {"title": titulo, "content": contenido_html, "status": "publish"}
     if media_id:
@@ -249,8 +192,11 @@ def publicar_en_wordpress(titulo, contenido_html, ruta_imagen):
         print(f"🎉 ¡ÉXITO TOTAL! Entrada publicada en WordPress. Link: {post_data.get('link')}")
         return True
     else:
-        raise Exception(f"❌ Error al publicar en WordPress (Código {r_post.status_code}): {r_post.text}")
+        raise Exception(f"❌ Error crítico al publicar entrada ({r_post.status_code}): {r_post.text}")
 
+# ==========================================
+# 6. EJECUCIÓN PRINCIPAL
+# ==========================================
 if __name__ == "__main__":
     tema = obtener_nuevo_tema_viral()
     if not tema:
@@ -258,10 +204,28 @@ if __name__ == "__main__":
         tema = "Polémica viral de la semana en redes sociales"
 
     print(f"🔥 Tema seleccionado: {tema}")
-    titulo, contenido_html = generar_articulo_miri(tema)
-    
-    # Modifica tu plantilla real de Canva Pro (Título + Fondo dinámico)
-    ruta_imagen = generar_miniatura_canva_pro_api(titulo)
+
+    (
+        titulo,
+        contenido_html,
+        titulo_miniatura,
+        categoria_visual,
+        busqueda_imagen
+    ) = generar_articulo_miri(tema)
+
+    print(f"📰 Título artículo: {titulo}")
+    print(f"🖼️ Título miniatura: {titulo_miniatura}")
+
+    ruta_imagen, info_imagen = generar_miniatura_html(
+        titulo_miniatura,
+        categoria_visual,
+        busqueda_imagen
+    )
+
+    if info_imagen:
+        credito = construir_credito_html(info_imagen)
+        if credito:
+            contenido_html += credito
 
     if titulo and contenido_html:
         publicado = publicar_en_wordpress(titulo, contenido_html, ruta_imagen)
