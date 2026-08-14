@@ -152,6 +152,19 @@ MAX_INTENTOS_VERIFICACION = int(
     os.environ.get("MAX_INTENTOS_VERIFICACION", "6")
 )
 
+# PRUEBA MANUAL:
+# Si FORCE_RUN=1, el bot ignora SOLO el control de frecuencia y ejecuta
+# una publicación completa. Por defecto sigue desactivado.
+FORCE_RUN = str(
+    os.environ.get("FORCE_RUN", "0")
+).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "si",
+    "sí",
+}
+
 HEADERS_BROWSER = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -191,7 +204,11 @@ UMBRAL_SCORE = {
     "marca": 58,
     "evento": 52,
     "lugar": 48,
-    "tema": 42,
+    # Para temas conceptuales, Wikimedia/Openverse suelen tener
+    # metadatos mucho más breves. El umbral baja, pero SOLO se
+    # acepta si los metadatos reales contienen conceptos de la
+    # búsqueda; la query nunca cuenta por sí sola como evidencia.
+    "tema": 28,
 }
 
 OUTPUT_IMAGE = "miniatura_destacada.jpg"
@@ -2834,7 +2851,20 @@ REGLAS EDITORIALES PARA ELEGIR LA IMAGEN:
 6. No uses búsquedas genéricas como:
    "news", "party", "viral news", "people".
 
-7. titulo_miniatura:
+7. Si tipo_visual = "tema":
+   - entidad_principal debe ser el CONCEPTO VISUAL concreto,
+     nunca "TikTok", "Instagram", "Internet" o "viral".
+   - busquedas_imagen deben describir objetos, acciones o escenas
+     fotografiables y concretas.
+   - escribe preferiblemente las búsquedas en INGLÉS porque
+     Wikimedia Commons y Openverse suelen devolver mejores resultados.
+   - NO incluyas "TikTok", "viral", "trend", "social media" ni "news"
+     salvo que la plataforma sea realmente el objeto que debe verse.
+   - Ejemplo:
+     tema sobre desodorantes -> ["deodorant spray", "deodorant can bathroom",
+     "personal hygiene deodorant"], NO ["TikTok deodorant viral trend"].
+
+8. titulo_miniatura:
    - 3 a 9 palabras.
    - máximo 60 caracteres.
    - visual y claro.
@@ -3396,12 +3426,30 @@ def enriquecer_busquedas_genericas(
             f"{entidad} venue",
         ])
 
-    elif tipo_visual == "tema" and contexto:
-        queries.append(contexto)
+    elif tipo_visual == "tema":
+        # Para temas conceptuales buscamos el OBJETO/ACCIÓN concreta,
+        # no la plataforma ni la palabra "viral".
+        conceptuales = []
+
+        for q in list(queries) + [contexto, entidad]:
+            q_limpia = limpiar_query_conceptual(
+                q
+            )
+
+            if not q_limpia:
+                continue
+
+            conceptuales.extend([
+                q_limpia,
+                f"{q_limpia} photo",
+            ])
+
+        # Primero las búsquedas limpias y concretas.
+        queries = conceptuales + queries
 
     return deduplicar_lista(
         queries
-    )[:8]
+    )[:10]
 
 
 # ==========================================
@@ -3958,6 +4006,100 @@ def contar_personas_aprox_imagen(
         return None
 
 
+
+# Palabras que describen plataforma/viralidad, pero no el objeto
+# que debería aparecer en la fotografía.
+STOPWORDS_VISUALES = {
+    "tiktok", "instagram", "youtube", "facebook", "twitter", "x",
+    "viral", "trend", "trending", "tendencia", "moda", "internet",
+    "social", "media", "redes", "news", "noticia", "noticias",
+    "spain", "espana", "españa", "today", "hoy", "video", "videos",
+    "reel", "reels", "short", "shorts", "online",
+}
+
+
+def tokens_visuales_significativos(texto):
+    texto = normalizar_texto(
+        texto
+    )
+
+    tokens = re.findall(
+        r"[a-z0-9áéíóúüñ]+",
+        texto
+    )
+
+    salida = []
+
+    for token in tokens:
+        if len(token) < 3:
+            continue
+
+        if token in STOPWORDS_VISUALES:
+            continue
+
+        if token not in salida:
+            salida.append(
+                token
+            )
+
+    return salida
+
+
+def limpiar_query_conceptual(query):
+    """
+    Elimina palabras de plataforma/viralidad para que un tema como
+    'TikTok viral deodorant trend' termine buscando el OBJETO real:
+    'deodorant', no logos o capturas genéricas de TikTok.
+    """
+    tokens = tokens_visuales_significativos(
+        query
+    )
+
+    return " ".join(
+        tokens[:8]
+    ).strip()
+
+
+def coincidencia_query_con_metadatos(
+    candidato,
+    texto_total
+):
+    """
+    Importante: NO suma puntos por haber hecho una búsqueda.
+
+    Solo usa la query para saber qué conceptos comprobar y exige que
+    esos conceptos aparezcan DE VERDAD en título/descripción/metadatos
+    del candidato.
+    """
+    query = candidato.get(
+        "search_query",
+        ""
+    )
+
+    query_tokens = set(
+        tokens_visuales_significativos(
+            query
+        )
+    )
+
+    meta_tokens = set(
+        tokens_visuales_significativos(
+            texto_total
+        )
+    )
+
+    if not query_tokens:
+        return 0, []
+
+    matches = sorted(
+        query_tokens.intersection(
+            meta_tokens
+        )
+    )
+
+    return len(matches), matches
+
+
 # ==========================================
 # 11. PUNTUACIÓN DE CANDIDATOS
 # ==========================================
@@ -4230,14 +4372,53 @@ def puntuar_candidato(
         if entidad_principal:
             score += int(
                 cobertura_entidad
-                * 12
+                * 10
             )
 
         if contexto_visual:
             score += int(
                 cobertura_contexto
-                * 12
+                * 8
             )
+
+        n_matches, matches = coincidencia_query_con_metadatos(
+            candidato,
+            texto_total
+        )
+
+        # La imagen conceptual necesita AL MENOS una coincidencia real.
+        if n_matches == 0:
+            score -= 18
+        else:
+            score += min(
+                8 * n_matches,
+                28
+            )
+
+            candidato[
+                "conceptos_coincidentes"
+            ] = matches
+
+        # Bonus si el propio título del archivo contiene un concepto.
+        title_tokens = set(
+            tokens_visuales_significativos(
+                title
+            )
+        )
+
+        query_tokens = set(
+            tokens_visuales_significativos(
+                candidato.get(
+                    "search_query",
+                    ""
+                )
+            )
+        )
+
+        if title_tokens.intersection(
+            query_tokens
+        ):
+            score += 7
 
     return score
 
@@ -4443,10 +4624,17 @@ def evaluar_y_descargar_candidatos(
     mejor_candidato = None
     mejor_score = -99999
 
-    # Descargamos y evaluamos hasta 10 candidatos completos.
+    # En temas conceptuales damos más oportunidades porque los
+    # metadatos de bancos abiertos suelen ser escuetos.
+    max_candidatos = (
+        16
+        if tipo_visual == "tema"
+        else 10
+    )
+
     # Ya no se devuelve el primero que pasa: se elige el mejor.
     for indice, candidato in enumerate(
-        puntuados[:10],
+        puntuados[:max_candidatos],
         start=1
     ):
         ruta = descargar_candidato(
@@ -4641,6 +4829,15 @@ def recolectar_candidatos_fuente(
             )
 
         for cand in resultados:
+            cand = dict(
+                cand
+            )
+
+            # Se conserva aparte. NO se añade a "meta".
+            cand[
+                "search_query"
+            ] = query
+
             clave = (
                 cand.get(
                     "source_page"
@@ -5589,6 +5786,17 @@ def generar_miniatura(
             busquedas_imagen=busquedas_imagen
         )
     )
+
+    if ruta_imagen_real and info_imagen:
+        print(
+            "🖼️ FOTO REAL seleccionada para la miniatura: "
+            f"{info_imagen.get('title') or info_imagen.get('source_page')}"
+        )
+    else:
+        print(
+            "🎨 FALLBACK gráfico: no se encontró una foto con "
+            "metadatos suficientemente relacionados."
+        )
 
     crear_miniatura_brandeada(
         titulo_miniatura=titulo_miniatura,
@@ -6961,8 +7169,17 @@ if __name__ == "__main__":
         "   - Vídeo vertical: generado para publicación manual "
         "(no cuenta en la frecuencia)"
     )
+    print(
+        "   - Modo prueba manual FORCE_RUN: "
+        + ("ACTIVO" if FORCE_RUN else "desactivado")
+    )
 
-    if not puede_publicar_ahora():
+    if FORCE_RUN:
+        print(
+            "🧪 FORCE_RUN activo: se ignora SOLO el control de frecuencia "
+            "para esta ejecución manual."
+        )
+    elif not puede_publicar_ahora():
         raise SystemExit(0)
 
     tendencia = obtener_nuevo_tema_viral()
