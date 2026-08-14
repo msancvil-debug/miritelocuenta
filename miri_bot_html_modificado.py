@@ -124,6 +124,21 @@ METRICOOL_PUBLICACIONES_MES = int(
     os.environ.get("METRICOOL_PUBLICACIONES_MES", "20")
 )
 
+# GitHub Actions expone automáticamente GITHUB_EVENT_NAME.
+# - workflow_dispatch = ejecución manual pulsando "Run workflow"
+# - schedule = ejecución automática programada
+#
+# Las ejecuciones MANUALES saltan solo el control de frecuencia para
+# poder probar/publicar cuando tú quieras.
+# Las ejecuciones PROGRAMADAS mantienen el límite de 20 artículos/mes.
+GITHUB_EVENT_NAME = str(
+    os.environ.get("GITHUB_EVENT_NAME", "")
+).strip().lower()
+
+EJECUCION_MANUAL_GITHUB = (
+    GITHUB_EVENT_NAME == "workflow_dispatch"
+)
+
 COOLDOWN_ENTIDAD_DIAS = int(
     os.environ.get("COOLDOWN_ENTIDAD_DIAS", "7")
 )
@@ -5455,8 +5470,21 @@ if __name__ == "__main__":
     print(
         "   - Imagen: sistema original de miniatura 1200x630"
     )
+    print(
+        "   - Ejecución GitHub: "
+        + (
+            "MANUAL (publica ahora)"
+            if EJECUCION_MANUAL_GITHUB
+            else "PROGRAMADA (respeta frecuencia)"
+        )
+    )
 
-    if not puede_publicar_ahora():
+    if EJECUCION_MANUAL_GITHUB:
+        print(
+            "🧪 Ejecución MANUAL de GitHub detectada: "
+            "se ignora solo el intervalo de 37 h para esta ejecución."
+        )
+    elif not puede_publicar_ahora():
         raise SystemExit(0)
 
     tendencia = obtener_nuevo_tema_viral()
