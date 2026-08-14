@@ -2571,7 +2571,7 @@ REGLAS MUY IMPORTANTES:
   siendo claramente conversación actual.
 
 Devuelve SOLO JSON:
-{
+{{
   "verificable": true,
   "es_tendencia_real": true,
   "confianza": 0,
@@ -2585,12 +2585,12 @@ Devuelve SOLO JSON:
     "dato, exageración o rumor que no debe publicarse"
   ],
   "fuentes": [
-    {
+    {{
       "nombre": "medio/sitio",
       "url": "https://..."
-    }
+    }}
   ]
-}
+}}
 
 confianza: 0-100.
 """
