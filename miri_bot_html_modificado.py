@@ -1,14 +1,43 @@
 import requests
 import json
 import os
-import time
 import html
 import re
-import base64
 import mimetypes
 import unicodedata
 import xml.etree.ElementTree as ET
 from io import BytesIO
+
+from PIL import Image, ImageDraw, ImageFont, ImageStat
+
+# ============================================================
+# MIRI TE LO CUENTA · BOT AUTOMÁTICO
+# ============================================================
+# FLUJO:
+# RSS -> Gemini -> selección visual editorial -> miniatura 1200x630
+# -> WordPress -> historial
+#
+# MOTOR VISUAL:
+# 1) Identifica el tipo visual:
+#    persona / programa / marca / evento / lugar / tema
+# 2) Prioriza Wikimedia Commons.
+# 3) Si Wikimedia no ofrece una opción suficientemente fiable,
+#    prueba Openverse.
+# 4) Si la noticia trata de UNA persona:
+#    - exige relación fuerte con el nombre
+#    - penaliza y descarta fotos de grupo/cast/equipos si no hay
+#      evidencia suficiente de que sean una opción adecuada
+# 5) Para lugares, busca imágenes reales del lugar.
+# 6) Penaliza imágenes casi en blanco y negro si existen alternativas.
+# 7) Si ninguna imagen supera el umbral de seguridad/relevancia,
+#    usa un fallback gráfico con el branding.
+#
+# NO REQUIERE NUEVAS CREDENCIALES NI PERMISOS.
+# Requisitos Python:
+#   requests
+#   pillow
+# ============================================================
+
 
 # ==========================================
 # 1. VARIABLES DE ENTORNO
@@ -31,12 +60,14 @@ HEADERS_BROWSER = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/122.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8"
 }
 
-OPENVERSE_API = "https://api.openverse.org/v1/images/"
 WIKIMEDIA_API = "https://commons.wikimedia.org/w/api.php"
+OPENVERSE_API = "https://api.openverse.org/v1/images/"
 
+# Licencias permitidas en Openverse.
+# Se excluyen NC/ND para mantener abierta la monetización.
 OPENVERSE_LICENSES_PERMITIDAS = {
     "cc0",
     "pdm",
@@ -44,29 +75,15 @@ OPENVERSE_LICENSES_PERMITIDAS = {
     "by-sa",
 }
 
-COLOR_NEGRO = "#161616"
-COLOR_CORAL = "#F04438"
-COLOR_MARFIL = "#FFF7EF"
-COLOR_AMARILLO = "#FFD84D"
-COLOR_GRIS = "#D8D4CF"
-
-CATEGORIAS_VALIDAS = {
-    "ESTÁ PASANDO",
-    "SE HA LIADO",
-    "TE PONGO EN CONTEXTO",
-    "INTERNET ESTÁ HABLANDO",
-    "¿QUIÉN ES?",
-    "MIRI REACCIONA",
-    "REALITY",
-    "VIRAL",
-    "INTERNET",
-}
-
+# ==========================================
+# 2. CONFIGURACIÓN EDITORIAL / VISUAL
+# ==========================================
 TIPOS_VISUALES_VALIDOS = {
     "persona",
     "programa",
     "marca",
     "evento",
+    "lugar",
     "tema",
 }
 
@@ -75,30 +92,247 @@ UMBRAL_SCORE = {
     "programa": 58,
     "marca": 58,
     "evento": 52,
+    "lugar": 48,
     "tema": 42,
 }
 
+OUTPUT_IMAGE = "miniatura_destacada.jpg"
+
+# Branding Miri te lo cuenta
+COLOR_BG = "#E9E1DA"
+COLOR_BLACK = "#0E0E10"
+COLOR_WHITE = "#FAFAFA"
+COLOR_RED = "#F04438"
+COLOR_YELLOW = "#FFD84D"
+COLOR_GREY = "#6A6663"
+COLOR_LIGHT_GREY = "#C9C1BA"
+
 
 # ==========================================
-# 2. GESTIÓN DE HISTORIAL Y TENDENCIAS
+# 3. UTILIDADES GENERALES
+# ==========================================
+def limpiar_html_tags(texto):
+    return re.sub(r"<[^>]+>", " ", texto or "").strip()
+
+
+def normalizar_texto(texto):
+    texto = texto or ""
+    texto = html.unescape(str(texto))
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(
+        c for c in texto
+        if not unicodedata.combining(c)
+    )
+    texto = texto.lower()
+    texto = re.sub(r"[^a-z0-9\s]", " ", texto)
+    texto = re.sub(r"\s+", " ", texto).strip()
+    return texto
+
+
+def tokenizar(texto):
+    stop = {
+        "de", "del", "la", "las", "el", "los", "y", "en",
+        "the", "of", "and", "a", "an", "for", "to", "on",
+        "con", "por", "para", "un", "una", "at", "in"
+    }
+
+    return [
+        t for t in normalizar_texto(texto).split()
+        if len(t) >= 2 and t not in stop
+    ]
+
+
+def deduplicar_lista(lista):
+    vistos = set()
+    salida = []
+
+    for item in lista or []:
+        item = str(item or "").strip()
+
+        if not item:
+            continue
+
+        clave = normalizar_texto(item)
+
+        if clave and clave not in vistos:
+            vistos.add(clave)
+            salida.append(item)
+
+    return salida
+
+
+def asegurar_lista(valor):
+    if isinstance(valor, list):
+        return [
+            str(x).strip()
+            for x in valor
+            if str(x).strip()
+        ]
+
+    if isinstance(valor, str) and valor.strip():
+        return [valor.strip()]
+
+    return []
+
+
+def contiene_entidad_exacta(entidad, texto):
+    ent = normalizar_texto(entidad)
+    txt = normalizar_texto(texto)
+    return bool(ent and ent in txt)
+
+
+def porcentaje_cobertura_entidad(entidad, texto):
+    ent_tokens = set(tokenizar(entidad))
+    txt_tokens = set(tokenizar(texto))
+
+    if not ent_tokens:
+        return 0.0
+
+    return (
+        len(ent_tokens.intersection(txt_tokens))
+        / max(1, len(ent_tokens))
+    )
+
+
+def limitar_texto(texto, max_len=95):
+    texto = re.sub(
+        r"\s+",
+        " ",
+        str(texto or "").strip()
+    )
+
+    if len(texto) <= max_len:
+        return texto
+
+    return texto[:max_len - 1].rstrip() + "…"
+
+
+def extraer_json_de_respuesta(raw_text):
+    raw_text = (raw_text or "").strip()
+
+    if raw_text.startswith("```"):
+        raw_text = (
+            raw_text
+            .replace("```json", "")
+            .replace("```", "")
+            .strip()
+        )
+
+    try:
+        return json.loads(raw_text)
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", raw_text, re.S)
+
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            pass
+
+    raise ValueError(
+        "No se pudo extraer un JSON válido de la respuesta."
+    )
+
+
+def normalizar_tipo_visual(tipo_visual):
+    tipo = normalizar_texto(tipo_visual)
+
+    equivalencias = {
+        "person": "persona",
+        "persona": "persona",
+        "celebridad": "persona",
+        "personaje": "persona",
+
+        "programa": "programa",
+        "tv": "programa",
+        "television": "programa",
+        "reality": "programa",
+        "show": "programa",
+        "serie": "programa",
+
+        "marca": "marca",
+        "brand": "marca",
+        "empresa": "marca",
+        "plataforma": "marca",
+
+        "evento": "evento",
+        "event": "evento",
+
+        "lugar": "lugar",
+        "place": "lugar",
+        "location": "lugar",
+        "city": "lugar",
+        "town": "lugar",
+        "ciudad": "lugar",
+        "localizacion": "lugar",
+        "destino": "lugar",
+        "pais": "lugar",
+        "recinto": "lugar",
+
+        "tema": "tema",
+        "topic": "tema",
+        "concepto": "tema",
+    }
+
+    tipo = equivalencias.get(tipo, tipo)
+
+    if tipo not in TIPOS_VISUALES_VALIDOS:
+        return "tema"
+
+    return tipo
+
+
+# ==========================================
+# 4. HISTORIAL Y TENDENCIAS
 # ==========================================
 def cargar_historial():
     if os.path.exists(HISTORIAL_FILE):
         try:
-            with open(HISTORIAL_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(
+                HISTORIAL_FILE,
+                "r",
+                encoding="utf-8"
+            ) as f:
+                data = json.load(f)
+                return data if isinstance(data, list) else []
         except Exception:
             return []
+
     return []
 
 
 def guardar_en_historial(tema):
     historial = cargar_historial()
+
     if tema not in historial:
         historial.append(tema)
 
-    with open(HISTORIAL_FILE, "w", encoding="utf-8") as f:
-        json.dump(historial, f, ensure_ascii=False, indent=2)
+    with open(
+        HISTORIAL_FILE,
+        "w",
+        encoding="utf-8"
+    ) as f:
+        json.dump(
+            historial,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+
+def limpiar_titulo_feed(title):
+    title = (title or "").strip()
+
+    # Elimina sufijos típicos tipo " - Medio X"
+    title = re.sub(
+        r"\s+-\s+[^-]{2,60}$",
+        "",
+        title
+    ).strip()
+
+    return title
 
 
 def obtener_nuevo_tema_viral():
@@ -112,46 +346,68 @@ def obtener_nuevo_tema_viral():
                 timeout=15
             )
 
-            if res.status_code == 200:
-                root = ET.fromstring(res.content)
+            if res.status_code != 200:
+                continue
 
-                for item in root.findall(".//item"):
-                    title_elem = item.find("title")
+            root = ET.fromstring(res.content)
 
-                    if title_elem is not None and title_elem.text:
-                        title = title_elem.text.strip()
+            for item in root.findall(".//item"):
+                title_elem = item.find("title")
 
-                        if title and title not in historial:
-                            return title
+                if title_elem is None or not title_elem.text:
+                    continue
+
+                title = limpiar_titulo_feed(
+                    title_elem.text
+                )
+
+                if title and title not in historial:
+                    return title
 
         except Exception as e:
-            print(f"⚠️ Error leyendo feed {feed_url}: {e}")
+            print(
+                f"⚠️ Error leyendo feed {feed_url}: {e}"
+            )
 
     return None
 
 
 # ==========================================
-# 3. GENERACIÓN DE ARTÍCULOS CON GEMINI
+# 5. GEMINI - GENERACIÓN DEL ARTÍCULO
 # ==========================================
 def obtener_modelos_disponibles():
     url_list = (
-        "https://generativelanguage.googleapis.com/v1beta/models"
+        "https://generativelanguage.googleapis.com/"
+        "v1beta/models"
         f"?key={GEMINI_API_KEY}"
     )
 
     try:
-        res = requests.get(url_list, timeout=10)
+        res = requests.get(
+            url_list,
+            timeout=10
+        )
 
         if res.status_code == 200:
-            models_data = res.json().get("models", [])
+            models_data = res.json().get(
+                "models",
+                []
+            )
 
             modelos_validos = [
-                m.get("name", "").replace("models/", "")
+                m.get("name", "")
+                .replace("models/", "")
                 for m in models_data
-                if "generateContent" in m.get(
-                    "supportedGenerationMethods", []
+                if "generateContent"
+                in m.get(
+                    "supportedGenerationMethods",
+                    []
                 )
-                and "gemini" in m.get("name", "").lower()
+                and "gemini"
+                in m.get(
+                    "name",
+                    ""
+                ).lower()
             ]
 
             if modelos_validos:
@@ -160,150 +416,133 @@ def obtener_modelos_disponibles():
     except Exception:
         pass
 
-    return ["gemini-1.5-flash", "gemini-1.5-pro"]
-
-
-def normalizar_categoria(categoria):
-    categoria = (categoria or "").strip().upper()
-
-    equivalencias = {
-        "SALSEO": "SE HA LIADO",
-        "POLÉMICA": "SE HA LIADO",
-        "POLEMICA": "SE HA LIADO",
-        "TELECINCO": "REALITY",
-        "REALITIES": "REALITY",
-        "REDES": "INTERNET",
-        "REDES SOCIALES": "INTERNET",
-        "ACTUALIDAD": "ESTÁ PASANDO",
-        "ESTA PASANDO": "ESTÁ PASANDO",
-        "CONTEXTO": "TE PONGO EN CONTEXTO",
-        "QUIÉN ES": "¿QUIÉN ES?",
-        "QUIEN ES": "¿QUIÉN ES?",
-        "REACCIÓN": "MIRI REACCIONA",
-        "REACCION": "MIRI REACCIONA",
-    }
-
-    if "/" in categoria:
-        partes = [p.strip() for p in categoria.split("/") if p.strip()]
-        for parte in partes:
-            normalizada = equivalencias.get(parte, parte)
-            if normalizada in CATEGORIAS_VALIDAS:
-                return normalizada
-
-    categoria = equivalencias.get(categoria, categoria)
-
-    if categoria not in CATEGORIAS_VALIDAS:
-        categoria = "ESTÁ PASANDO"
-
-    return categoria
-
-
-def normalizar_tipo_visual(tipo_visual):
-    tipo = (tipo_visual or "").strip().lower()
-
-    equivalencias = {
-        "person": "persona",
-        "celebridad": "persona",
-        "personaje": "persona",
-        "tv": "programa",
-        "reality": "programa",
-        "show": "programa",
-        "brand": "marca",
-        "event": "evento",
-        "topic": "tema",
-        "concepto": "tema",
-    }
-
-    tipo = equivalencias.get(tipo, tipo)
-
-    if tipo not in TIPOS_VISUALES_VALIDOS:
-        tipo = "tema"
-
-    return tipo
+    return [
+        "gemini-1.5-flash",
+        "gemini-1.5-pro"
+    ]
 
 
 def generar_articulo_miri(tema_viral):
     modelos = obtener_modelos_disponibles()
 
     prompt = f"""
-Eres la redactora principal del portal de actualidad, entretenimiento
-y cultura de Internet "Miri te lo cuenta".
+Eres la redactora principal del portal de actualidad,
+entretenimiento y cultura de Internet "Miri te lo cuenta".
 
-Escribe un artículo ameno, fresco, dinámico y con tono de salseo sobre:
+Escribe un artículo ameno, fresco, dinámico y con tono
+de salseo sobre esta tendencia:
+
 "{tema_viral}"
 
-Responde ÚNICAMENTE con un objeto JSON válido, sin Markdown ni bloques de código.
+IMPORTANTE:
+- No inventes hechos concretos que no estén justificados.
+- No inventes declaraciones textuales.
+- El contenido debe sonar natural y periodístico.
+- El artículo debe tener entre 4 y 7 párrafos cortos.
+- Responde ÚNICAMENTE con un objeto JSON válido.
+- No uses Markdown.
 
-La estructura debe ser exactamente:
+Devuelve EXACTAMENTE:
 
 {{
-  "titulo": "Titular atractivo y viral para el artículo",
+  "titulo": "Titular llamativo y claro",
   "contenido_html": "<p>Primer párrafo...</p><p>Segundo párrafo...</p>",
-  "titulo_miniatura": "TITULAR MUY CORTO PARA LA IMAGEN",
-  "categoria_visual": "UNA CATEGORÍA DE LA LISTA",
-  "tipo_visual": "persona | programa | marca | evento | tema",
-  "entidad_principal": "nombre exacto de la persona, programa, marca, evento o tema",
-  "contexto_visual": "2-6 palabras que ayuden a distinguir la entidad",
+  "titulo_miniatura": "TITULAR CORTO PARA LA MINIATURA",
+  "categoria_visual": "VIRAL / REDES / TELECINCO / REALITY / ACTUALIDAD",
+  "tipo_visual": "persona | programa | marca | evento | lugar | tema",
+  "entidad_principal": "entidad visual principal",
+  "contexto_visual": "contexto breve para evitar resultados erróneos",
   "busquedas_imagen": [
-    "búsqueda exacta 1",
-    "búsqueda exacta 2",
-    "búsqueda exacta 3"
+    "búsqueda 1",
+    "búsqueda 2",
+    "búsqueda 3"
   ]
 }}
 
-REGLAS PARA titulo_miniatura:
-- Debe ser distinto del título SEO si este es largo.
-- Entre 3 y 9 palabras.
-- Máximo 60 caracteres.
-- Debe funcionar visualmente en una miniatura.
-- No pongas punto final.
-
-REGLAS PARA categoria_visual:
-Escoge SOLO UNA de estas:
-- ESTÁ PASANDO
-- SE HA LIADO
-- TE PONGO EN CONTEXTO
-- INTERNET ESTÁ HABLANDO
-- ¿QUIÉN ES?
-- MIRI REACCIONA
-- REALITY
-- VIRAL
-- INTERNET
-
 REGLAS PARA tipo_visual:
-- "persona" si la noticia trata principalmente sobre una persona concreta.
-- "programa" si el sujeto principal es un programa, reality, serie o formato.
-- "marca" si la entidad principal es una empresa, plataforma o marca.
-- "evento" si la noticia gira alrededor de un evento concreto.
-- "tema" si no hay una entidad concreta.
 
-REGLAS PARA entidad_principal:
-- Si es persona, escribe su nombre completo exacto.
-- Si es programa/marca/evento, escribe el nombre exacto.
-- No metas descripciones aquí.
+- "persona":
+  si la noticia trata principalmente sobre UNA persona concreta.
 
-REGLAS PARA contexto_visual:
-- Debe ayudar a evitar homónimos o resultados irrelevantes.
-- Ejemplos: "skateboard Spain", "Telecinco reality", "TikTok social media".
+- "programa":
+  si el sujeto visual principal es un programa, reality,
+  serie o formato televisivo/digital.
 
-REGLAS PARA busquedas_imagen:
-- Devuelve 3 búsquedas.
-- Si es persona, TODAS deben incluir el nombre exacto y añadir contexto.
-- Si es programa/marca/evento, TODAS deben incluir el nombre exacto.
-- No uses búsquedas genéricas tipo "news party".
+- "marca":
+  si el sujeto principal es una empresa, plataforma o marca.
+
+- "evento":
+  si la noticia gira alrededor de un evento concreto.
+
+- "lugar":
+  si visualmente es más útil mostrar una ciudad, localidad,
+  playa, recinto, país, edificio o destino real.
+
+- "tema":
+  si no existe una entidad concreta y conviene una imagen
+  conceptual relacionada.
+
+REGLAS EDITORIALES PARA ELEGIR LA IMAGEN:
+
+1. Si trata de UNA PERSONA:
+   - entidad_principal = nombre completo exacto.
+   - TODAS las búsquedas deben incluir el nombre.
+   - añade profesión/programa/contexto para evitar homónimos.
+   - Ejemplo:
+     ["Danny León skateboard",
+      "Danny León skater Spain",
+      "Danny León Red Bull skate"]
+
+2. Si trata de un LUGAR:
+   - entidad_principal = nombre exacto del lugar.
+   - prioriza el lugar frente a una imagen genérica.
+   - Ejemplo para Salou:
+     ["Salou beach",
+      "Salou promenade Spain",
+      "Salou Tarragona skyline"]
+
+3. Si una noticia habla de un traslado, evento o emisión
+   desde una ciudad y no hay una persona concreta como
+   protagonista, normalmente elige "lugar".
+
+4. Si trata de un programa:
+   usa el nombre exacto del programa + contexto.
+
+5. No inventes personajes visuales.
+
+6. No uses búsquedas genéricas como:
+   "news", "party", "viral news", "people".
+
+7. titulo_miniatura:
+   - 3 a 9 palabras.
+   - máximo 60 caracteres.
+   - visual y claro.
 """
 
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json"
+    }
 
     payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"response_mime_type": "application/json"}
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ],
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "temperature": 0.7
+        }
     }
 
     for modelo in modelos:
         url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{modelo}:generateContent?key={GEMINI_API_KEY}"
+            "https://generativelanguage.googleapis.com/"
+            "v1beta/models/"
+            f"{modelo}:generateContent"
+            f"?key={GEMINI_API_KEY}"
         )
 
         try:
@@ -311,392 +550,789 @@ REGLAS PARA busquedas_imagen:
                 url,
                 headers=headers,
                 json=payload,
-                timeout=40
+                timeout=50
             )
 
-            if response.status_code == 200:
-                raw_text = (
-                    response.json()["candidates"][0]["content"]["parts"][0]["text"]
-                    .strip()
-                )
+            if response.status_code != 200:
+                continue
 
-                if raw_text.startswith("```"):
-                    raw_text = (
-                        raw_text
-                        .replace("```json", "")
-                        .replace("```", "")
-                        .strip()
+            data = response.json()
+
+            raw_text = (
+                data["candidates"][0]
+                ["content"]
+                ["parts"][0]
+                ["text"]
+                .strip()
+            )
+
+            articulo = extraer_json_de_respuesta(
+                raw_text
+            )
+
+            titulo = html.unescape(
+                articulo.get(
+                    "titulo",
+                    ""
+                )
+            ).strip().strip('"').strip("'")
+
+            contenido_html = articulo.get(
+                "contenido_html",
+                ""
+            )
+
+            titulo_miniatura = html.unescape(
+                articulo.get(
+                    "titulo_miniatura",
+                    titulo
+                )
+            ).strip()
+
+            categoria_visual = (
+                articulo.get(
+                    "categoria_visual",
+                    "ACTUALIDAD"
+                )
+                or "ACTUALIDAD"
+            ).strip()
+
+            tipo_visual = normalizar_tipo_visual(
+                articulo.get(
+                    "tipo_visual",
+                    "tema"
+                )
+            )
+
+            entidad_principal = html.unescape(
+                articulo.get(
+                    "entidad_principal",
+                    ""
+                )
+                or ""
+            ).strip()
+
+            contexto_visual = html.unescape(
+                articulo.get(
+                    "contexto_visual",
+                    ""
+                )
+                or ""
+            ).strip()
+
+            busquedas_imagen = deduplicar_lista(
+                asegurar_lista(
+                    articulo.get(
+                        "busquedas_imagen"
                     )
-
-                articulo = json.loads(raw_text)
-
-                titulo = html.unescape(
-                    articulo["titulo"]
-                ).strip().strip('"').strip("'")
-
-                contenido_html = articulo["contenido_html"]
-
-                titulo_miniatura = html.unescape(
-                    articulo.get("titulo_miniatura") or titulo
-                ).strip().strip('"').strip("'")
-
-                if len(titulo_miniatura) > 72:
-                    recortado = titulo_miniatura[:69]
-                    if " " in recortado:
-                        recortado = recortado.rsplit(" ", 1)[0]
-                    titulo_miniatura = recortado + "…"
-
-                categoria_visual = normalizar_categoria(
-                    articulo.get("categoria_visual")
                 )
+            )
 
-                tipo_visual = normalizar_tipo_visual(
-                    articulo.get("tipo_visual")
+            if not busquedas_imagen:
+                base = (
+                    entidad_principal
+                    or contexto_visual
+                    or tema_viral
                 )
+                busquedas_imagen = [base]
 
-                entidad_principal = html.unescape(
-                    articulo.get("entidad_principal") or ""
-                ).strip()
-
-                contexto_visual = html.unescape(
-                    articulo.get("contexto_visual") or ""
-                ).strip()
-
-                busquedas_imagen = articulo.get("busquedas_imagen") or []
-
-                if not isinstance(busquedas_imagen, list):
-                    busquedas_imagen = [str(busquedas_imagen)]
-
-                busquedas_imagen = [
-                    html.unescape(str(q)).strip()
-                    for q in busquedas_imagen
-                    if str(q).strip()
-                ]
-
-                base = " ".join(
-                    x for x in [entidad_principal, contexto_visual] if x
-                ).strip()
-
-                if base and base not in busquedas_imagen:
-                    busquedas_imagen.append(base)
-
-                if entidad_principal and entidad_principal not in busquedas_imagen:
-                    busquedas_imagen.append(entidad_principal)
-
-                busquedas_imagen = busquedas_imagen[:5]
-
-                return (
-                    titulo,
-                    contenido_html,
+            return {
+                "titulo": titulo,
+                "contenido_html": contenido_html,
+                "titulo_miniatura": limitar_texto(
                     titulo_miniatura,
-                    categoria_visual,
-                    tipo_visual,
-                    entidad_principal,
-                    contexto_visual,
-                    busquedas_imagen
-                )
+                    72
+                ),
+                "categoria_visual": categoria_visual,
+                "tipo_visual": tipo_visual,
+                "entidad_principal": entidad_principal,
+                "contexto_visual": contexto_visual,
+                "busquedas_imagen": busquedas_imagen,
+            }
 
         except Exception as e:
-            print(f"⚠️ Fallo con el modelo {modelo}: {e}")
+            print(
+                f"⚠️ Fallo con el modelo {modelo}: {e}"
+            )
             continue
 
     raise Exception(
-        "❌ Error crítico: La API de Gemini no pudo generar el artículo."
+        "❌ Error crítico: Gemini no pudo generar el artículo."
     )
 
 
 # ==========================================
-# 4. MOTOR VISUAL INDEPENDIENTE
+# 6. BÚSQUEDAS VISUALES
 # ==========================================
-def quitar_html(texto):
-    if not texto:
-        return ""
+def enriquecer_busquedas_lugar(
+    entidad_principal,
+    contexto_visual,
+    busquedas_imagen
+):
+    entidad = (
+        entidad_principal
+        or ""
+    ).strip()
 
-    texto = re.sub(r"<[^>]+>", "", str(texto))
-    texto = html.unescape(texto)
-    texto = re.sub(r"\s+", " ", texto).strip()
-    return texto
+    contexto = (
+        contexto_visual
+        or ""
+    ).strip()
+
+    base = []
+
+    if entidad:
+        base.extend([
+            entidad,
+            f"{entidad} city",
+            f"{entidad} skyline",
+            f"{entidad} city view",
+            f"{entidad} beach",
+            f"{entidad} promenade",
+            f"{entidad} tourism",
+            f"{entidad} Spain",
+        ])
+
+    if entidad and contexto:
+        base.extend([
+            f"{entidad} {contexto}",
+            f"{entidad} {contexto} Spain",
+        ])
+
+    return deduplicar_lista(
+        (busquedas_imagen or [])
+        + base
+    )[:8]
 
 
-def normalizar_texto(texto):
-    texto = quitar_html(texto).lower().strip()
-    texto = unicodedata.normalize("NFKD", texto)
-    texto = "".join(
-        c for c in texto
-        if not unicodedata.combining(c)
+def enriquecer_busquedas_genericas(
+    tipo_visual,
+    entidad_principal,
+    contexto_visual,
+    busquedas_imagen
+):
+    if tipo_visual == "lugar":
+        return enriquecer_busquedas_lugar(
+            entidad_principal,
+            contexto_visual,
+            busquedas_imagen
+        )
+
+    queries = list(
+        busquedas_imagen
+        or []
     )
-    texto = re.sub(r"[^a-z0-9\s]", " ", texto)
-    texto = re.sub(r"\s+", " ", texto).strip()
-    return texto
+
+    entidad = (
+        entidad_principal
+        or ""
+    ).strip()
+
+    contexto = (
+        contexto_visual
+        or ""
+    ).strip()
+
+    if entidad and contexto:
+        queries.append(
+            f"{entidad} {contexto}"
+        )
+
+    if entidad:
+        queries.append(entidad)
+
+    if tipo_visual == "persona" and entidad:
+        queries.extend([
+            f"{entidad} portrait",
+            f"{entidad} official",
+            f"{entidad} {contexto}".strip(),
+        ])
+
+    elif tipo_visual == "programa" and entidad:
+        queries.extend([
+            f"{entidad} television",
+            f"{entidad} TV show",
+        ])
+
+    elif tipo_visual == "marca" and entidad:
+        queries.extend([
+            f"{entidad} brand",
+            f"{entidad} headquarters",
+        ])
+
+    elif tipo_visual == "evento" and entidad:
+        queries.extend([
+            f"{entidad} event",
+            f"{entidad} venue",
+        ])
+
+    elif tipo_visual == "tema" and contexto:
+        queries.append(contexto)
+
+    return deduplicar_lista(
+        queries
+    )[:8]
 
 
-def tokens_significativos(texto):
-    stop = {
-        "de", "del", "la", "las", "el", "los", "y", "en",
-        "the", "of", "and", "a", "an", "for", "to", "on",
-        "con", "por", "para", "un", "una"
-    }
-
-    return [
-        t for t in normalizar_texto(texto).split()
-        if len(t) >= 3 and t not in stop
-    ]
-
-
-def cobertura_tokens(objetivo, texto):
-    objetivo_tokens = tokens_significativos(objetivo)
-
-    if not objetivo_tokens:
-        return 0.0
-
-    texto_norm = set(tokens_significativos(texto))
-
-    coincidencias = sum(
-        1 for t in objetivo_tokens
-        if t in texto_norm
+# ==========================================
+# 7. LICENCIAS
+# ==========================================
+def licencia_wikimedia_permitida(
+    licencia
+):
+    texto = normalizar_texto(
+        licencia
     )
-
-    return coincidencias / len(objetivo_tokens)
-
-
-def metadatos_candidato(candidato):
-    return " ".join([
-        candidato.get("title") or "",
-        candidato.get("description") or "",
-        candidato.get("author") or "",
-        candidato.get("source") or "",
-        candidato.get("page_url") or "",
-        candidato.get("query") or "",
-    ])
-
-
-def contiene_entidad_exacta(entidad, candidato):
-    entidad_norm = normalizar_texto(entidad)
-    meta_norm = normalizar_texto(metadatos_candidato(candidato))
-
-    if not entidad_norm:
-        return False
-
-    return entidad_norm in meta_norm
-
-
-def licencia_wikimedia_permitida(licencia):
-    texto = (licencia or "").lower().strip()
 
     if not texto:
         return False
 
-    if "noncommercial" in texto or "no derivatives" in texto:
+    # Rechazo NC / ND
+    if (
+        "noncommercial" in texto
+        or "no derivatives" in texto
+        or re.search(
+            r"(^|\s)nc($|\s)",
+            texto
+        )
+        or re.search(
+            r"(^|\s)nd($|\s)",
+            texto
+        )
+    ):
         return False
 
-    if re.search(r"(^|[-\s])nc($|[-\s])", texto):
-        return False
-    if re.search(r"(^|[-\s])nd($|[-\s])", texto):
-        return False
-
-    permitidas = (
+    permitidas = [
         "public domain",
         "cc0",
         "cc by",
-        "cc-by",
+        "cc by sa",
         "creative commons attribution",
+    ]
+
+    return any(
+        x in texto
+        for x in permitidas
     )
 
-    return any(x in texto for x in permitidas)
 
-
-def buscar_candidatos_openverse(busqueda, limite=12):
-    print(f"🔎 Openverse: {busqueda}")
-
-    params = {
-        "q": busqueda,
-        "page_size": min(limite, 20),
-    }
-
-    candidatos = []
-
+# ==========================================
+# 8. WIKIMEDIA COMMONS
+# ==========================================
+def extraer_extmeta_val(
+    extmetadata,
+    key
+):
     try:
-        res = requests.get(
-            OPENVERSE_API,
-            params=params,
-            headers=HEADERS_BROWSER,
-            timeout=15
+        return limpiar_html_tags(
+            html.unescape(
+                (
+                    extmetadata.get(key)
+                    or {}
+                ).get(
+                    "value",
+                    ""
+                )
+            )
         )
-
-        if res.status_code != 200:
-            print(f"⚠️ Openverse respondió {res.status_code}.")
-            return []
-
-        resultados = res.json().get("results", [])
-
-        for item in resultados:
-            licencia = (item.get("license") or "").lower().strip()
-
-            if licencia not in OPENVERSE_LICENSES_PERMITIDAS:
-                continue
-
-            autor = quitar_html(item.get("creator"))
-
-            if licencia in {"by", "by-sa"} and not autor:
-                continue
-
-            url_principal = item.get("url")
-            url_fallback = item.get("thumbnail")
-
-            if not (url_principal or url_fallback):
-                continue
-
-            candidatos.append({
-                "url": url_principal or url_fallback,
-                "url_fallback": url_fallback,
-                "author": autor or "Dominio público",
-                "license": (
-                    "Public Domain Mark"
-                    if licencia == "pdm"
-                    else f"CC {licencia.upper()}"
-                ),
-                "license_url": item.get("license_url") or "",
-                "source": item.get("source") or "Openverse",
-                "page_url": (
-                    item.get("foreign_landing_url")
-                    or item.get("detail_url")
-                    or ""
-                ),
-                "title": item.get("title") or "",
-                "description": item.get("description") or "",
-                "width": item.get("width") or 0,
-                "height": item.get("height") or 0,
-                "query": busqueda,
-            })
-
-    except Exception as e:
-        print(f"⚠️ Error buscando en Openverse: {e}")
-
-    return candidatos
+    except Exception:
+        return ""
 
 
-def buscar_candidatos_wikimedia(busqueda, limite=12):
-    print(f"🔎 Wikimedia: {busqueda}")
+def buscar_imagenes_wikimedia(
+    query,
+    limit=10
+):
+    query = (
+        query
+        or ""
+    ).strip()
+
+    if not query:
+        return []
+
+    print(
+        f"🔎 Wikimedia: {query}"
+    )
 
     params = {
         "action": "query",
         "format": "json",
         "generator": "search",
-        "gsrsearch": busqueda,
+        "gsrsearch": query,
         "gsrnamespace": 6,
-        "gsrlimit": min(limite, 20),
-        "prop": "imageinfo",
-        "iiprop": "url|extmetadata|size",
-        "iiurlwidth": 1600,
+        "gsrlimit": min(limit, 20),
+        "prop": "imageinfo|info",
+        "iiprop": "url|mime|size|extmetadata",
+        "inprop": "url",
     }
 
-    candidatos = []
-
     try:
-        res = requests.get(
+        r = requests.get(
             WIKIMEDIA_API,
             params=params,
             headers=HEADERS_BROWSER,
-            timeout=15
+            timeout=20
         )
 
-        if res.status_code != 200:
-            print(f"⚠️ Wikimedia respondió {res.status_code}.")
+        if r.status_code != 200:
             return []
 
-        pages = res.json().get("query", {}).get("pages", {})
+        pages = (
+            r.json()
+            .get("query", {})
+            .get("pages", {})
+        )
+
+        resultados = []
 
         for page in pages.values():
-            infos = page.get("imageinfo") or []
+            imageinfo = (
+                page.get("imageinfo")
+                or [{}]
+            )[0]
 
-            if not infos:
-                continue
+            mime = (
+                imageinfo.get("mime")
+                or ""
+            ).lower()
 
-            info = infos[0]
-            meta = info.get("extmetadata") or {}
-
-            licencia = quitar_html(
-                (meta.get("LicenseShortName") or {}).get("value")
+            url = imageinfo.get(
+                "url"
             )
 
-            if not licencia_wikimedia_permitida(licencia):
+            width = int(
+                imageinfo.get("width")
+                or 0
+            )
+
+            height = int(
+                imageinfo.get("height")
+                or 0
+            )
+
+            if not url:
                 continue
 
-            autor = quitar_html(
-                (meta.get("Artist") or {}).get("value")
-            )
+            if mime not in {
+                "image/jpeg",
+                "image/png",
+                "image/webp",
+            }:
+                continue
 
             if (
-                ("cc by" in licencia.lower() or "cc-by" in licencia.lower())
-                and not autor
+                width < 500
+                or height < 300
             ):
                 continue
 
-            url_principal = info.get("thumburl") or info.get("url")
-            url_fallback = info.get("url")
+            extmetadata = (
+                imageinfo.get(
+                    "extmetadata",
+                    {}
+                )
+                or {}
+            )
 
-            if not url_principal:
+            title = (
+                page.get(
+                    "title",
+                    ""
+                )
+                .replace(
+                    "File:",
+                    ""
+                )
+                .strip()
+            )
+
+            description = extraer_extmeta_val(
+                extmetadata,
+                "ImageDescription"
+            )
+
+            artist = extraer_extmeta_val(
+                extmetadata,
+                "Artist"
+            )
+
+            license_name = extraer_extmeta_val(
+                extmetadata,
+                "LicenseShortName"
+            )
+
+            if not licencia_wikimedia_permitida(
+                license_name
+            ):
                 continue
 
-            descripcion = quitar_html(
-                (meta.get("ImageDescription") or {}).get("value")
+            credit = extraer_extmeta_val(
+                extmetadata,
+                "Credit"
             )
 
-            licencia_url = quitar_html(
-                (meta.get("LicenseUrl") or {}).get("value")
+            object_name = extraer_extmeta_val(
+                extmetadata,
+                "ObjectName"
             )
 
-            candidatos.append({
-                "url": url_principal,
-                "url_fallback": url_fallback,
-                "author": autor or "Wikimedia Commons",
-                "license": licencia or "Licencia abierta",
-                "license_url": licencia_url,
-                "source": "Wikimedia Commons",
-                "page_url": info.get("descriptionurl") or "",
-                "title": page.get("title") or "",
-                "description": descripcion,
-                "width": info.get("thumbwidth") or info.get("width") or 0,
-                "height": info.get("thumbheight") or info.get("height") or 0,
-                "query": busqueda,
+            categories = extraer_extmeta_val(
+                extmetadata,
+                "Categories"
+            )
+
+            license_url = extraer_extmeta_val(
+                extmetadata,
+                "LicenseUrl"
+            )
+
+            meta = " ".join(
+                filter(
+                    None,
+                    [
+                        title,
+                        description,
+                        artist,
+                        credit,
+                        object_name,
+                        categories,
+                        query,
+                    ]
+                )
+            )
+
+            resultados.append({
+                "engine": "wikimedia",
+                "query": query,
+                "title": title,
+                "description": description,
+                "artist": artist,
+                "license": license_name,
+                "license_url": license_url,
+                "credit": credit,
+                "url": url,
+                "fallback_url": "",
+                "mime": mime,
+                "width": width,
+                "height": height,
+                "source_page": (
+                    page.get("fullurl")
+                    or imageinfo.get(
+                        "descriptionurl",
+                        ""
+                    )
+                ),
+                "meta": meta,
             })
 
+        return resultados
+
     except Exception as e:
-        print(f"⚠️ Error buscando en Wikimedia: {e}")
+        print(
+            f"⚠️ Error Wikimedia '{query}': {e}"
+        )
+        return []
 
-    return candidatos
 
+# ==========================================
+# 9. OPENVERSE
+# ==========================================
+def buscar_imagenes_openverse(
+    query,
+    limit=12
+):
+    query = (
+        query
+        or ""
+    ).strip()
 
-def recolectar_candidatos(tipo_visual, busquedas_imagen):
-    todos = []
+    if not query:
+        return []
 
-    for busqueda in busquedas_imagen:
-        if tipo_visual in {"persona", "programa", "marca", "evento"}:
-            todos.extend(buscar_candidatos_wikimedia(busqueda))
-            todos.extend(buscar_candidatos_openverse(busqueda))
-        else:
-            todos.extend(buscar_candidatos_openverse(busqueda))
-            todos.extend(buscar_candidatos_wikimedia(busqueda))
+    print(
+        f"🔎 Openverse: {query}"
+    )
 
-    vistos = set()
-    unicos = []
+    params = {
+        "q": query,
+        "page_size": min(
+            limit,
+            20
+        ),
+    }
 
-    for c in todos:
-        clave = (
-            c.get("page_url")
-            or c.get("url")
-            or c.get("title")
+    try:
+        r = requests.get(
+            OPENVERSE_API,
+            params=params,
+            headers=HEADERS_BROWSER,
+            timeout=20
         )
 
-        if not clave or clave in vistos:
-            continue
+        if r.status_code != 200:
+            return []
 
-        vistos.add(clave)
-        unicos.append(c)
+        resultados = []
 
-    return unicos
+        for item in (
+            r.json()
+            .get(
+                "results",
+                []
+            )
+        ):
+            licencia = (
+                item.get("license")
+                or ""
+            ).lower().strip()
+
+            if (
+                licencia
+                not in OPENVERSE_LICENSES_PERMITIDAS
+            ):
+                continue
+
+            artist = limpiar_html_tags(
+                item.get("creator")
+                or ""
+            )
+
+            if (
+                licencia
+                in {"by", "by-sa"}
+                and not artist
+            ):
+                continue
+
+            url = (
+                item.get("url")
+                or item.get("thumbnail")
+            )
+
+            fallback_url = (
+                item.get("thumbnail")
+                or ""
+            )
+
+            if not url:
+                continue
+
+            width = int(
+                item.get("width")
+                or 0
+            )
+
+            height = int(
+                item.get("height")
+                or 0
+            )
+
+            # Si hay dimensiones y son diminutas, descartamos.
+            if (
+                width
+                and height
+                and (
+                    width < 500
+                    or height < 300
+                )
+            ):
+                continue
+
+            title = limpiar_html_tags(
+                item.get("title")
+                or ""
+            )
+
+            description = limpiar_html_tags(
+                item.get("description")
+                or ""
+            )
+
+            source_page = (
+                item.get(
+                    "foreign_landing_url"
+                )
+                or item.get(
+                    "detail_url"
+                )
+                or ""
+            )
+
+            license_url = (
+                item.get(
+                    "license_url"
+                )
+                or ""
+            )
+
+            source = (
+                item.get("source")
+                or "Openverse"
+            )
+
+            meta = " ".join(
+                filter(
+                    None,
+                    [
+                        title,
+                        description,
+                        artist,
+                        source,
+                        query,
+                        source_page,
+                    ]
+                )
+            )
+
+            license_label = (
+                "Public Domain Mark"
+                if licencia == "pdm"
+                else f"CC {licencia.upper()}"
+            )
+
+            resultados.append({
+                "engine": "openverse",
+                "query": query,
+                "title": title,
+                "description": description,
+                "artist": (
+                    artist
+                    or "Dominio público"
+                ),
+                "license": license_label,
+                "license_url": license_url,
+                "credit": source,
+                "url": url,
+                "fallback_url": fallback_url,
+                "mime": "",
+                "width": width,
+                "height": height,
+                "source_page": source_page,
+                "meta": meta,
+            })
+
+        return resultados
+
+    except Exception as e:
+        print(
+            f"⚠️ Error Openverse '{query}': {e}"
+        )
+        return []
 
 
+# ==========================================
+# 10. DETECCIÓN DE FOTOS DE GRUPO
+# ==========================================
+def parece_imagen_grupal_por_metadatos(
+    candidato
+):
+    meta = normalizar_texto(
+        " ".join([
+            candidato.get(
+                "title",
+                ""
+            ),
+            candidato.get(
+                "description",
+                ""
+            ),
+            candidato.get(
+                "meta",
+                ""
+            ),
+        ])
+    )
+
+    palabras_grupo = {
+        "group",
+        "groups",
+        "team",
+        "teams",
+        "cast",
+        "family",
+        "friends",
+        "people",
+        "crowd",
+        "members",
+        "grupo",
+        "grupos",
+        "equipo",
+        "equipos",
+        "reparto",
+        "familia",
+        "amigos",
+        "gente",
+        "multitud",
+        "miembros",
+        "crew",
+        "squad",
+    }
+
+    tokens = set(
+        meta.split()
+    )
+
+    return any(
+        palabra in tokens
+        for palabra in palabras_grupo
+    )
+
+
+def contar_personas_aprox_imagen(
+    ruta_imagen
+):
+    """
+    Filtro adicional opcional usando OpenCV si ya está instalado.
+    NO es obligatorio.
+
+    Devuelve:
+    - None: no se pudo analizar
+    - 0,1,2...: número aproximado de caras detectadas
+
+    Si cv2 no está disponible, el bot sigue funcionando solo
+    con metadatos, sin romper nada.
+    """
+    try:
+        import cv2
+
+        img = cv2.imread(
+            ruta_imagen
+        )
+
+        if img is None:
+            return None
+
+        gray = cv2.cvtColor(
+            img,
+            cv2.COLOR_BGR2GRAY
+        )
+
+        cascade_path = (
+            cv2.data.haarcascades
+            + "haarcascade_frontalface_default.xml"
+        )
+
+        detector = cv2.CascadeClassifier(
+            cascade_path
+        )
+
+        caras = detector.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(45, 45)
+        )
+
+        return len(caras)
+
+    except Exception:
+        return None
+
+
+# ==========================================
+# 11. PUNTUACIÓN DE CANDIDATOS
+# ==========================================
 def puntuar_candidato(
     candidato,
     tipo_visual,
@@ -704,170 +1340,447 @@ def puntuar_candidato(
     contexto_visual
 ):
     score = 0
-    meta = metadatos_candidato(candidato)
-    meta_norm = normalizar_texto(meta)
 
-    entidad_norm = normalizar_texto(entidad_principal)
-    cobertura_entidad = cobertura_tokens(
-        entidad_principal,
-        meta
+    title = candidato.get(
+        "title",
+        ""
     )
 
-    cobertura_contexto = cobertura_tokens(
-        contexto_visual,
-        meta
+    meta = candidato.get(
+        "meta",
+        ""
     )
 
-    if entidad_norm and entidad_norm in meta_norm:
-        score += 55
-    else:
-        score += int(cobertura_entidad * 35)
+    texto_total = (
+        f"{title} {meta}"
+    )
 
-    score += int(cobertura_contexto * 20)
+    meta_norm = normalizar_texto(
+        texto_total
+    )
 
-    if candidato.get("source") == "Wikimedia Commons":
-        score += 7
+    width = int(
+        candidato.get(
+            "width",
+            0
+        )
+        or 0
+    )
 
-    width = int(candidato.get("width") or 0)
-    height = int(candidato.get("height") or 0)
+    height = int(
+        candidato.get(
+            "height",
+            0
+        )
+        or 0
+    )
 
-    if width >= 1000 and height >= 600:
-        score += 10
-    elif width >= 700 and height >= 400:
+    cobertura_entidad = (
+        porcentaje_cobertura_entidad(
+            entidad_principal,
+            texto_total
+        )
+    )
+
+    cobertura_contexto = (
+        porcentaje_cobertura_entidad(
+            contexto_visual,
+            texto_total
+        )
+    )
+
+    # Calidad / resolución
+    if width >= 1600:
+        score += 12
+    elif width >= 1200:
+        score += 9
+    elif width >= 900:
+        score += 6
+    elif width >= 700:
+        score += 3
+
+    if height >= 630:
+        score += 4
+
+    # Ratio horizontal útil
+    if width > 0 and height > 0:
+        ratio = width / height
+        ideal = 1200 / 630
+        diff = abs(
+            ratio - ideal
+        )
+
+        if diff < 0.2:
+            score += 10
+        elif diff < 0.45:
+            score += 7
+        elif diff < 0.8:
+            score += 3
+
+    # Penalizamos recursos no fotográficos.
+    palabras_negativas = [
+        "logo",
+        "icon",
+        "map",
+        "flag",
+        "coat of arms",
+        "escudo",
+        "bandera",
+        "diagram",
+        "vector",
+        "svg",
+        "poster",
+        "cartel",
+    ]
+
+    if any(
+        p in meta_norm
+        for p in palabras_negativas
+    ):
+        score -= 22
+
+    # Wikimedia recibe pequeño bonus al ser fuente prioritaria.
+    if (
+        candidato.get("engine")
+        == "wikimedia"
+    ):
         score += 5
-    elif width and height and (width < 500 or height < 300):
-        score -= 15
 
-    palabras_grupo = {
-        "group", "family", "team", "friends", "crowd",
-        "grupo", "familia", "equipo", "amigos", "multitud",
-        "cast", "reparto",
-    }
-
+    # --------------------
+    # PERSONA
+    # --------------------
     if tipo_visual == "persona":
-        if any(p in meta_norm.split() for p in palabras_grupo):
-            score -= 18
-
-        # Regla crítica:
-        # para una persona no aceptamos una imagen si sus metadatos
-        # no contienen de forma suficientemente clara el nombre.
         if entidad_principal:
-            if not contiene_entidad_exacta(entidad_principal, candidato):
+            entidad_exacta = contiene_entidad_exacta(
+                entidad_principal,
+                texto_total
+            )
+
+            if entidad_exacta:
+                score += 48
+            else:
+                score += int(
+                    cobertura_entidad
+                    * 28
+                )
+
+                # Regla estricta:
+                # si buscamos una persona y los metadatos no
+                # contienen suficientemente el nombre, se descarta.
                 if cobertura_entidad < 0.75:
                     return -999
 
-    elif tipo_visual in {"programa", "marca", "evento"}:
+        if contexto_visual:
+            score += int(
+                cobertura_contexto
+                * 12
+            )
+
+        # FOTO DE GRUPO:
+        # no la aceptamos alegremente cuando el artículo trata
+        # exclusivamente sobre una persona.
+        if parece_imagen_grupal_por_metadatos(
+            candidato
+        ):
+            score -= 40
+
+    # --------------------
+    # PROGRAMA / MARCA / EVENTO
+    # --------------------
+    elif tipo_visual in {
+        "programa",
+        "marca",
+        "evento",
+    }:
         if entidad_principal:
-            if not contiene_entidad_exacta(entidad_principal, candidato):
-                if cobertura_entidad < 0.60:
-                    score -= 35
+            if contiene_entidad_exacta(
+                entidad_principal,
+                texto_total
+            ):
+                score += 28
+            else:
+                score += int(
+                    cobertura_entidad
+                    * 22
+                )
+
+                if cobertura_entidad < 0.50:
+                    score -= 25
+
+        if contexto_visual:
+            score += int(
+                cobertura_contexto
+                * 10
+            )
+
+    # --------------------
+    # LUGAR
+    # --------------------
+    elif tipo_visual == "lugar":
+        if entidad_principal:
+            if contiene_entidad_exacta(
+                entidad_principal,
+                texto_total
+            ):
+                score += 34
+            else:
+                score += int(
+                    cobertura_entidad
+                    * 22
+                )
+
+                if cobertura_entidad < 0.50:
+                    score -= 18
+
+        if contexto_visual:
+            score += int(
+                cobertura_contexto
+                * 10
+            )
+
+        señales_lugar = [
+            "city",
+            "town",
+            "beach",
+            "coast",
+            "promenade",
+            "skyline",
+            "harbour",
+            "harbor",
+            "landscape",
+            "street",
+            "architecture",
+            "ciudad",
+            "playa",
+            "paseo",
+            "costa",
+            "vista",
+            "turismo",
+            "puerto",
+            "paisaje",
+            "calle",
+            "arquitectura",
+        ]
+
+        coincidencias = sum(
+            1
+            for palabra
+            in señales_lugar
+            if palabra
+            in meta_norm
+        )
+
+        score += min(
+            coincidencias * 4,
+            20
+        )
+
+        # Evitamos retratos cuando el foco debe ser el lugar.
+        palabras_retrato = [
+            "portrait",
+            "person",
+            "people",
+            "man",
+            "woman",
+            "retrato",
+            "persona",
+            "gente",
+            "hombre",
+            "mujer",
+        ]
+
+        if any(
+            p in meta_norm
+            for p in palabras_retrato
+        ):
+            score -= 18
+
+    # --------------------
+    # TEMA
+    # --------------------
+    elif tipo_visual == "tema":
+        if entidad_principal:
+            score += int(
+                cobertura_entidad
+                * 12
+            )
+
+        if contexto_visual:
+            score += int(
+                cobertura_contexto
+                * 12
+            )
 
     return score
 
 
-def descargar_imagen_bytes(url):
-    if not url:
-        return None, None
-
+# ==========================================
+# 12. DESCARGA Y ANÁLISIS VISUAL
+# ==========================================
+def descargar_archivo(
+    url,
+    ruta_local
+):
     try:
-        res = requests.get(
+        r = requests.get(
             url,
             headers=HEADERS_BROWSER,
-            timeout=20,
+            timeout=30,
             allow_redirects=True
         )
 
-        if res.status_code != 200:
-            return None, None
+        if (
+            r.status_code == 200
+            and r.content
+            and len(r.content)
+            <= 20 * 1024 * 1024
+        ):
+            with open(
+                ruta_local,
+                "wb"
+            ) as f:
+                f.write(
+                    r.content
+                )
 
-        content_type = (
-            res.headers.get("Content-Type", "")
-            .split(";")[0]
-            .strip()
-            .lower()
+            return True
+
+    except Exception:
+        pass
+
+    return False
+
+
+def descargar_candidato(
+    candidato,
+    indice
+):
+    urls = deduplicar_lista([
+        candidato.get("url"),
+        candidato.get(
+            "fallback_url"
+        ),
+    ])
+
+    for intento, url in enumerate(
+        urls,
+        start=1
+    ):
+        ext = ".jpg"
+
+        lower_url = (
+            url
+            or ""
+        ).lower()
+
+        if ".png" in lower_url:
+            ext = ".png"
+        elif ".webp" in lower_url:
+            ext = ".webp"
+
+        ruta = (
+            f"tmp_visual_"
+            f"{indice}_"
+            f"{intento}"
+            f"{ext}"
         )
 
-        if not content_type.startswith("image/"):
-            return None, None
+        if descargar_archivo(
+            url,
+            ruta
+        ):
+            try:
+                # Verifica que realmente se puede abrir como imagen.
+                with Image.open(
+                    ruta
+                ) as im:
+                    im.verify()
 
-        if len(res.content) > 18 * 1024 * 1024:
-            return None, None
+                return ruta
 
-        return res.content, content_type
+            except Exception:
+                try:
+                    os.remove(ruta)
+                except Exception:
+                    pass
 
-    except Exception as e:
-        print(f"⚠️ Error descargando imagen: {e}")
-        return None, None
+    return None
 
 
-def analizar_imagen_bytes(data):
+def analizar_imagen_real(
+    ruta_imagen
+):
     resultado = {
         "width": 0,
         "height": 0,
         "casi_monocroma": False,
     }
 
-    if not data:
-        return resultado
-
     try:
-        from PIL import Image, ImageStat
+        with Image.open(
+            ruta_imagen
+        ) as im:
+            rgb = im.convert(
+                "RGB"
+            )
 
-        img = Image.open(BytesIO(data)).convert("RGB")
-        resultado["width"], resultado["height"] = img.size
+            resultado[
+                "width"
+            ], resultado[
+                "height"
+            ] = rgb.size
 
-        muestra = img.copy()
-        muestra.thumbnail((240, 240))
+            muestra = rgb.copy()
+            muestra.thumbnail(
+                (260, 260)
+            )
 
-        stat = ImageStat.Stat(muestra)
-        r, g, b = stat.mean[:3]
-        diferencia_medias = max(r, g, b) - min(r, g, b)
+            stat = ImageStat.Stat(
+                muestra
+            )
 
-        pixeles = list(muestra.getdata())
+            r, g, b = stat.mean[:3]
 
-        if pixeles:
-            dif_media = sum(
-                max(px) - min(px)
-                for px in pixeles
-            ) / len(pixeles)
-        else:
-            dif_media = 0
+            diferencia_medias = (
+                max(r, g, b)
+                - min(r, g, b)
+            )
 
-        resultado["casi_monocroma"] = (
-            diferencia_medias < 10
-            and dif_media < 16
-        )
+            # HSV: canal S (saturación)
+            hsv = muestra.convert(
+                "HSV"
+            )
+
+            sat_stat = ImageStat.Stat(
+                hsv
+            )
+
+            saturacion_media = (
+                sat_stat.mean[1]
+            )
+
+            resultado[
+                "casi_monocroma"
+            ] = (
+                diferencia_medias < 13
+                and saturacion_media < 22
+            )
 
     except Exception:
-        # Pillow es opcional. Si no está, no bloqueamos el bot.
         pass
 
     return resultado
 
 
-def convertir_a_data_uri(data, mime):
-    if not data or not mime:
-        return None
-
-    encoded = base64.b64encode(data).decode("ascii")
-    return f"data:{mime};base64,{encoded}"
-
-
-def seleccionar_mejor_imagen(
+# ==========================================
+# 13. SELECCIÓN POR FUENTE
+# ==========================================
+def evaluar_y_descargar_candidatos(
+    candidatos,
     tipo_visual,
     entidad_principal,
-    contexto_visual,
-    busquedas_imagen
+    contexto_visual
 ):
-    candidatos = recolectar_candidatos(
-        tipo_visual,
-        busquedas_imagen
-    )
-
-    if not candidatos:
-        print("⚠️ No hay candidatos de imagen.")
-        return None, None
-
     puntuados = []
 
     for candidato in candidatos:
@@ -882,582 +1795,1084 @@ def seleccionar_mejor_imagen(
             continue
 
         candidato["score_metadata"] = score
-        puntuados.append(candidato)
+        puntuados.append(
+            candidato
+        )
 
     puntuados.sort(
-        key=lambda x: x.get("score_metadata", 0),
+        key=lambda x: x.get(
+            "score_metadata",
+            0
+        ),
         reverse=True
     )
 
-    for candidato in puntuados[:8]:
-        data = None
-        mime = None
+    umbral = UMBRAL_SCORE.get(
+        tipo_visual,
+        42
+    )
 
-        for url in [
-            candidato.get("url"),
-            candidato.get("url_fallback")
-        ]:
-            if not url:
-                continue
+    # Probamos máximo 10 para no eternizar la ejecución.
+    for indice, candidato in enumerate(
+        puntuados[:10],
+        start=1
+    ):
+        ruta = descargar_candidato(
+            candidato,
+            indice
+        )
 
-            data, mime = descargar_imagen_bytes(url)
-
-            if data and mime:
-                break
-
-        if not data:
+        if not ruta:
             continue
 
-        analisis = analizar_imagen_bytes(data)
-        score = candidato.get("score_metadata", 0)
+        analisis = analizar_imagen_real(
+            ruta
+        )
 
-        ancho_real = analisis.get("width") or 0
-        alto_real = analisis.get("height") or 0
+        score = candidato.get(
+            "score_metadata",
+            0
+        )
 
-        if ancho_real >= 1000 and alto_real >= 600:
-            score += 8
-        elif ancho_real and alto_real and (
-            ancho_real < 500 or alto_real < 300
+        ancho = analisis.get(
+            "width",
+            0
+        )
+
+        alto = analisis.get(
+            "height",
+            0
+        )
+
+        if (
+            ancho >= 1200
+            and alto >= 630
         ):
-            score -= 20
+            score += 8
 
-        if analisis.get("casi_monocroma"):
+        elif (
+            ancho
+            and alto
+            and (
+                ancho < 500
+                or alto < 300
+            )
+        ):
             score -= 25
-            candidato["es_monocroma"] = True
+
+        # Blanco y negro / casi monocroma
+        if analisis.get(
+            "casi_monocroma"
+        ):
+            score -= 24
         else:
-            candidato["es_monocroma"] = False
             score += 5
 
-        candidato["score_final"] = score
-        candidato["width_real"] = ancho_real
-        candidato["height_real"] = alto_real
+        # Segunda capa para noticias sobre una única persona:
+        # si OpenCV está disponible y detecta más de una cara,
+        # descartamos la imagen.
+        if tipo_visual == "persona":
+            caras = contar_personas_aprox_imagen(
+                ruta
+            )
 
-        umbral = UMBRAL_SCORE.get(tipo_visual, 42)
+            if (
+                caras is not None
+                and caras >= 2
+            ):
+                print(
+                    "🚫 Foto descartada: "
+                    f"parece contener {caras} personas "
+                    "y la noticia es sobre una sola persona."
+                )
+
+                try:
+                    os.remove(
+                        ruta
+                    )
+                except Exception:
+                    pass
+
+                continue
 
         print(
-            f"🧪 Candidato: {candidato.get('title') or 'sin título'} "
-            f"| score={score} | fuente={candidato.get('source')} "
-            f"| monocroma={candidato.get('es_monocroma')}"
+            "🧪 "
+            f"{candidato.get('engine')} | "
+            f"score={score} | "
+            f"{candidato.get('title') or 'sin título'} | "
+            f"monocroma={analisis.get('casi_monocroma')}"
         )
 
         if score >= umbral:
-            data_uri = convertir_a_data_uri(data, mime)
+            candidato[
+                "score_final"
+            ] = score
 
-            if data_uri:
-                print(
-                    f"✅ Imagen seleccionada con score {score}: "
-                    f"{candidato.get('title') or candidato.get('source')}"
+            candidato[
+                "width_real"
+            ] = ancho
+
+            candidato[
+                "height_real"
+            ] = alto
+
+            print(
+                "✅ Imagen aprobada: "
+                f"{candidato.get('title') or candidato.get('source_page')}"
+            )
+
+            return ruta, candidato
+
+        try:
+            os.remove(
+                ruta
+            )
+        except Exception:
+            pass
+
+    return None, None
+
+
+def recolectar_candidatos_fuente(
+    fuente,
+    queries
+):
+    todos = []
+    urls_vistas = set()
+
+    for query in queries:
+        if fuente == "wikimedia":
+            resultados = buscar_imagenes_wikimedia(
+                query,
+                limit=10
+            )
+        else:
+            resultados = buscar_imagenes_openverse(
+                query,
+                limit=12
+            )
+
+        for cand in resultados:
+            clave = (
+                cand.get(
+                    "source_page"
                 )
-                return candidato, data_uri
+                or cand.get(
+                    "url"
+                )
+                or cand.get(
+                    "title"
+                )
+            )
+
+            if (
+                not clave
+                or clave in urls_vistas
+            ):
+                continue
+
+            urls_vistas.add(
+                clave
+            )
+
+            todos.append(
+                cand
+            )
+
+    return todos
+
+
+# ==========================================
+# 14. SELECCIÓN FINAL:
+#     WIKIMEDIA -> OPENVERSE -> FALLBACK
+# ==========================================
+def seleccionar_mejor_imagen_real(
+    tipo_visual,
+    entidad_principal,
+    contexto_visual,
+    busquedas_imagen
+):
+    queries = enriquecer_busquedas_genericas(
+        tipo_visual,
+        entidad_principal,
+        contexto_visual,
+        busquedas_imagen
+    )
 
     print(
-        "⚠️ Ninguna imagen superó el umbral de relevancia/calidad. "
-        "Se usará el fondo gráfico de marca."
+        f"🧩 Tipo visual: {tipo_visual}"
+    )
+    print(
+        f"🎯 Entidad: {entidad_principal}"
+    )
+    print(
+        f"🧭 Contexto: {contexto_visual}"
+    )
+    print(
+        f"🔍 Búsquedas: {queries}"
+    )
+
+    # --------------------------------------
+    # PASO 1: WIKIMEDIA COMMONS
+    # --------------------------------------
+    print(
+        "🥇 Buscando primero en Wikimedia Commons..."
+    )
+
+    candidatos_wiki = recolectar_candidatos_fuente(
+        "wikimedia",
+        queries
+    )
+
+    ruta, info = evaluar_y_descargar_candidatos(
+        candidatos_wiki,
+        tipo_visual,
+        entidad_principal,
+        contexto_visual
+    )
+
+    if ruta and info:
+        return ruta, info
+
+    # --------------------------------------
+    # PASO 2: OPENVERSE
+    # --------------------------------------
+    print(
+        "🥈 Wikimedia no dio una opción suficientemente fiable. "
+        "Probando Openverse..."
+    )
+
+    candidatos_openverse = recolectar_candidatos_fuente(
+        "openverse",
+        queries
+    )
+
+    ruta, info = evaluar_y_descargar_candidatos(
+        candidatos_openverse,
+        tipo_visual,
+        entidad_principal,
+        contexto_visual
+    )
+
+    if ruta and info:
+        return ruta, info
+
+    # --------------------------------------
+    # PASO 3: FALLBACK DE MARCA
+    # --------------------------------------
+    print(
+        "⚠️ No hay una imagen suficientemente fiable. "
+        "Se usará el fallback gráfico de Miri te lo cuenta."
     )
 
     return None, None
 
 
-def calcular_font_size(titulo):
-    longitud = len(titulo or "")
+# ==========================================
+# 15. TIPOGRAFÍA / BRANDING
+# ==========================================
+def cargar_fuente(
+    size=32,
+    bold=False
+):
+    if bold:
+        posibles = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        ]
+    else:
+        posibles = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        ]
 
-    if longitud <= 28:
-        return 62
-    if longitud <= 42:
-        return 56
-    if longitud <= 58:
-        return 50
-    if longitud <= 72:
-        return 44
-    return 40
+    for path in posibles:
+        if os.path.exists(path):
+            return ImageFont.truetype(
+                path,
+                size=size
+            )
 
-
-def colores_categoria(categoria):
-    categoria = normalizar_categoria(categoria)
-
-    if categoria in {"SE HA LIADO", "MIRI REACCIONA"}:
-        return {
-            "pill_bg": COLOR_CORAL,
-            "pill_fg": "#FFFFFF",
-            "accent": COLOR_AMARILLO,
-        }
-
-    if categoria in {"TE PONGO EN CONTEXTO", "¿QUIÉN ES?"}:
-        return {
-            "pill_bg": COLOR_MARFIL,
-            "pill_fg": COLOR_NEGRO,
-            "accent": COLOR_CORAL,
-        }
-
-    return {
-        "pill_bg": COLOR_AMARILLO,
-        "pill_fg": COLOR_NEGRO,
-        "accent": COLOR_CORAL,
-    }
+    return ImageFont.load_default()
 
 
-def crear_html_miniatura(
+def ajustar_cobertura(
+    imagen,
+    target_w,
+    target_h
+):
+    img = imagen.copy().convert(
+        "RGB"
+    )
+
+    w, h = img.size
+
+    if w <= 0 or h <= 0:
+        return Image.new(
+            "RGB",
+            (target_w, target_h),
+            COLOR_BG
+        )
+
+    scale = max(
+        target_w / w,
+        target_h / h
+    )
+
+    new_w = max(
+        1,
+        int(w * scale)
+    )
+
+    new_h = max(
+        1,
+        int(h * scale)
+    )
+
+    img = img.resize(
+        (new_w, new_h),
+        Image.LANCZOS
+    )
+
+    left = max(
+        0,
+        (new_w - target_w) // 2
+    )
+
+    top = max(
+        0,
+        (new_h - target_h) // 2
+    )
+
+    return img.crop(
+        (
+            left,
+            top,
+            left + target_w,
+            top + target_h,
+        )
+    )
+
+
+def envolver_texto(
+    draw,
+    texto,
+    font,
+    max_width
+):
+    palabras = (
+        texto
+        or ""
+    ).split()
+
+    lineas = []
+    actual = ""
+
+    for palabra in palabras:
+        prueba = (
+            palabra
+            if not actual
+            else actual
+            + " "
+            + palabra
+        )
+
+        bbox = draw.textbbox(
+            (0, 0),
+            prueba,
+            font=font
+        )
+
+        ancho = (
+            bbox[2]
+            - bbox[0]
+        )
+
+        if ancho <= max_width:
+            actual = prueba
+
+        else:
+            if actual:
+                lineas.append(
+                    actual
+                )
+
+            actual = palabra
+
+    if actual:
+        lineas.append(
+            actual
+        )
+
+    return lineas
+
+
+def draw_pill(
+    draw,
+    x,
+    y,
+    text,
+    font,
+    fill,
+    text_fill,
+    outline=None,
+    padding_x=18,
+    padding_y=8
+):
+    bbox = draw.textbbox(
+        (0, 0),
+        text,
+        font=font
+    )
+
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+
+    w = tw + padding_x * 2
+    h = th + padding_y * 2
+
+    r = h // 2
+
+    draw.rounded_rectangle(
+        (
+            x,
+            y,
+            x + w,
+            y + h
+        ),
+        radius=r,
+        fill=fill,
+        outline=outline,
+        width=2 if outline else 0
+    )
+
+    draw.text(
+        (
+            x + padding_x,
+            y + padding_y - 1
+        ),
+        text,
+        font=font,
+        fill=text_fill
+    )
+
+    return (
+        x + w,
+        y + h
+    )
+
+
+# ==========================================
+# 16. FALLBACK GRÁFICO
+# ==========================================
+def crear_fondo_fallback(
+    size=(1200, 630)
+):
+    canvas = Image.new(
+        "RGB",
+        size,
+        COLOR_BG
+    )
+
+    draw = ImageDraw.Draw(
+        canvas
+    )
+
+    # Forma coral
+    draw.rounded_rectangle(
+        (
+            -120,
+            180,
+            430,
+            360
+        ),
+        radius=60,
+        fill=COLOR_RED
+    )
+
+    # Forma amarilla
+    draw.rounded_rectangle(
+        (
+            935,
+            38,
+            1265,
+            130
+        ),
+        radius=46,
+        fill=COLOR_YELLOW
+    )
+
+    # Arco gris
+    draw.arc(
+        (
+            470,
+            42,
+            800,
+            245
+        ),
+        start=215,
+        end=30,
+        fill=COLOR_GREY,
+        width=8
+    )
+
+    # Puntitos grises
+    for row in range(11):
+        for col in range(17):
+            x = 850 + col * 18
+            y = 140 + row * 18
+            r = 2
+
+            draw.ellipse(
+                (
+                    x-r,
+                    y-r,
+                    x+r,
+                    y+r
+                ),
+                fill="#7E7A77"
+            )
+
+    # Puntitos amarillos
+    for row in range(10):
+        for col in range(12):
+            x = 935 + col * 16
+            y = 12 + row * 16
+
+            draw.ellipse(
+                (
+                    x-1,
+                    y-1,
+                    x+1,
+                    y+1
+                ),
+                fill="#E8CF70"
+            )
+
+    # MIRI fantasma
+    ghost_font = cargar_fuente(
+        118,
+        bold=True
+    )
+
+    draw.text(
+        (48, 64),
+        "MIRI",
+        font=ghost_font,
+        fill="#D3CBC4"
+    )
+
+    return canvas
+
+
+# ==========================================
+# 17. MINIATURA CORPORATIVA 1200x630
+# ==========================================
+def crear_miniatura_brandeada(
     titulo_miniatura,
     categoria_visual,
-    image_data_uri=None
+    ruta_salida,
+    ruta_imagen_real=None
 ):
-    categoria_visual = normalizar_categoria(categoria_visual)
-    paleta = colores_categoria(categoria_visual)
-    font_size = calcular_font_size(titulo_miniatura)
+    W = 1200
+    H = 630
+    BOTTOM_H = 233
+    TOP_H = H - BOTTOM_H
 
-    titulo_safe = html.escape(titulo_miniatura)
-    categoria_safe = html.escape(categoria_visual)
-
-    if image_data_uri:
-        visual = f'''
-        <img
-            class="cover"
-            src="{image_data_uri}"
-            alt=""
-        />
-        '''
-        clase_extra = ""
-    else:
-        visual = '''
-        <div class="fallback-art">
-            <div class="fallback-word">MIRI</div>
-            <div class="blob blob-a"></div>
-            <div class="blob blob-b"></div>
-            <div class="dots"></div>
-            <div class="ring"></div>
-        </div>
-        '''
-        clase_extra = "no-photo"
-
-    return f'''<!doctype html>
-<html lang="es">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=1200, initial-scale=1">
-<style>
-    * {{ box-sizing: border-box; }}
-
-    html, body {{
-        width: 1200px;
-        height: 630px;
-        margin: 0;
-        padding: 0;
-        overflow: hidden;
-        background: {COLOR_MARFIL};
-        font-family: Inter, Arial, Helvetica, sans-serif;
-    }}
-
-    .card {{
-        position: relative;
-        width: 1200px;
-        height: 630px;
-        overflow: hidden;
-        background: {COLOR_MARFIL};
-    }}
-
-    .visual {{
-        position: absolute;
-        top: 0;
-        left: 0;
-        width: 1200px;
-        height: 410px;
-        overflow: hidden;
-        background: {COLOR_MARFIL};
-    }}
-
-    .cover {{
-        display: block;
-        width: 100%;
-        height: 100%;
-        object-fit: cover;
-        object-position: center 38%;
-        filter: saturate(.96) contrast(1.04);
-        transform: scale(1.01);
-    }}
-
-    .visual::after {{
-        content: "";
-        position: absolute;
-        inset: 0;
-        pointer-events: none;
-        background: linear-gradient(
-            to bottom,
-            rgba(22,22,22,0.01) 10%,
-            rgba(22,22,22,0.04) 55%,
-            rgba(22,22,22,0.58) 100%
-        );
-        z-index: 3;
-    }}
-
-    .visual::before {{
-        content: "";
-        position: absolute;
-        width: 255px;
-        height: 190px;
-        right: 20px;
-        top: 15px;
-        z-index: 4;
-        opacity: .34;
-        background-image: radial-gradient({COLOR_AMARILLO} 2.5px, transparent 2.5px);
-        background-size: 15px 15px;
-        transform: rotate(6deg);
-        pointer-events: none;
-    }}
-
-    .fallback-art {{
-        position: absolute;
-        inset: 0;
-        overflow: hidden;
-        background: linear-gradient(120deg, {COLOR_MARFIL} 0%, #F0E4DA 100%);
-    }}
-
-    .fallback-word {{
-        position: absolute;
-        left: 45px;
-        top: 65px;
-        color: {COLOR_NEGRO};
-        font-family: "Arial Black", Inter, Arial, sans-serif;
-        font-size: 188px;
-        font-weight: 900;
-        line-height: .88;
-        letter-spacing: -12px;
-        opacity: .075;
-        transform: rotate(-4deg);
-    }}
-
-    .blob {{ position: absolute; border-radius: 999px; }}
-
-    .blob-a {{
-        width: 535px;
-        height: 112px;
-        left: -90px;
-        top: 232px;
-        background: {COLOR_CORAL};
-        transform: rotate(-17deg);
-    }}
-
-    .blob-b {{
-        width: 345px;
-        height: 82px;
-        right: -70px;
-        top: 90px;
-        background: {COLOR_AMARILLO};
-        transform: rotate(23deg);
-    }}
-
-    .dots {{
-        position: absolute;
-        width: 300px;
-        height: 175px;
-        right: 50px;
-        bottom: 25px;
-        opacity: .55;
-        background-image: radial-gradient({COLOR_NEGRO} 3px, transparent 3px);
-        background-size: 18px 18px;
-        transform: rotate(-6deg);
-    }}
-
-    .ring {{
-        position: absolute;
-        width: 265px;
-        height: 145px;
-        left: 520px;
-        top: 75px;
-        border: 11px solid {COLOR_NEGRO};
-        border-left-color: transparent;
-        border-bottom-color: transparent;
-        border-radius: 50%;
-        opacity: .68;
-        transform: rotate(10deg);
-    }}
-
-    .top-brand {{
-        position: absolute;
-        left: 29px;
-        top: 25px;
-        z-index: 7;
-        padding: 8px 14px;
-        border: 2px solid {COLOR_MARFIL};
-        border-radius: 999px;
-        background: {COLOR_NEGRO};
-        color: {COLOR_MARFIL};
-        box-shadow: 3px 3px 0 rgba(0,0,0,.35);
-        font-size: 13px;
-        font-weight: 900;
-        letter-spacing: .08em;
-        text-transform: uppercase;
-    }}
-
-    .top-brand .dot {{ color: {COLOR_AMARILLO}; padding-right: 3px; }}
-
-    .no-photo .top-brand {{
-        color: {COLOR_NEGRO};
-        background: {COLOR_AMARILLO};
-        border-color: {COLOR_NEGRO};
-        box-shadow: 4px 4px 0 {COLOR_NEGRO};
-    }}
-
-    .no-photo .top-brand .dot {{ color: {COLOR_CORAL}; }}
-
-    .spark {{
-        position: absolute;
-        top: 315px;
-        right: 35px;
-        z-index: 8;
-        color: {COLOR_AMARILLO};
-        font-family: "Arial Black", Arial, sans-serif;
-        font-size: 55px;
-        line-height: 1;
-        transform: rotate(12deg);
-        text-shadow: 3px 3px 0 {COLOR_NEGRO};
-    }}
-
-    .accent-line {{
-        position: absolute;
-        left: 0;
-        top: 397px;
-        z-index: 9;
-        width: 1200px;
-        height: 15px;
-        background: {paleta["accent"]};
-    }}
-
-    .footer {{
-        position: absolute;
-        left: 0;
-        bottom: 0;
-        z-index: 10;
-        width: 1200px;
-        height: 233px;
-        padding: 31px 46px 27px 46px;
-        display: grid;
-        grid-template-columns: minmax(0, 1fr) 275px;
-        column-gap: 35px;
-        align-items: center;
-        overflow: hidden;
-        background: {COLOR_NEGRO};
-        color: #FFFFFF;
-    }}
-
-    .footer::before {{
-        content: "";
-        position: absolute;
-        width: 5px;
-        height: 92px;
-        left: 25px;
-        top: 88px;
-        background: {COLOR_CORAL};
-        transform: rotate(4deg);
-        border-radius: 4px;
-    }}
-
-    .footer::after {{
-        content: "";
-        position: absolute;
-        width: 235px;
-        height: 235px;
-        right: -90px;
-        bottom: -115px;
-        border: 16px solid {COLOR_CORAL};
-        border-radius: 50%;
-        opacity: .9;
-        pointer-events: none;
-    }}
-
-    .copy {{
-        min-width: 0;
-        position: relative;
-        z-index: 2;
-        padding-left: 7px;
-    }}
-
-    .pill {{
-        display: inline-flex;
-        align-items: center;
-        min-height: 34px;
-        margin-bottom: 13px;
-        padding: 7px 14px 6px;
-        border-radius: 999px;
-        border: 2px solid {COLOR_NEGRO};
-        background: {paleta["pill_bg"]};
-        color: {paleta["pill_fg"]};
-        box-shadow: 3px 3px 0 #000000;
-        font-size: 16px;
-        font-weight: 900;
-        letter-spacing: .075em;
-        line-height: 1;
-        text-transform: uppercase;
-    }}
-
-    .headline {{
-        max-width: 790px;
-        overflow: hidden;
-        color: #FFFFFF;
-        font-family: "Arial Black", Inter, Arial, Helvetica, sans-serif;
-        font-size: {font_size}px;
-        font-weight: 900;
-        line-height: .98;
-        letter-spacing: -2px;
-        text-wrap: balance;
-        display: -webkit-box;
-        -webkit-box-orient: vertical;
-        -webkit-line-clamp: 3;
-    }}
-
-    .logo-area {{
-        position: relative;
-        z-index: 3;
-        width: 260px;
-        justify-self: end;
-        align-self: end;
-        padding: 0 0 9px 5px;
-    }}
-
-    .logo-miri {{
-        margin-left: 8px;
-        color: {COLOR_MARFIL};
-        font-family: "Arial Black", Inter, Arial, sans-serif;
-        font-size: 62px;
-        font-weight: 900;
-        line-height: .79;
-        letter-spacing: -5px;
-    }}
-
-    .bubble {{
-        position: relative;
-        display: inline-block;
-        margin-top: 11px;
-        padding: 9px 15px 10px;
-        border-radius: 9px;
-        background: {COLOR_CORAL};
-        color: #FFFFFF;
-        box-shadow: 4px 4px 0 #000000;
-        font-size: 24px;
-        font-weight: 900;
-        line-height: 1;
-        letter-spacing: -1px;
-        transform: rotate(-1.5deg);
-    }}
-
-    .bubble::after {{
-        content: "";
-        position: absolute;
-        left: 23px;
-        bottom: -11px;
-        width: 0;
-        height: 0;
-        border-top: 13px solid {COLOR_CORAL};
-        border-right: 14px solid transparent;
-    }}
-
-    .handle {{
-        margin-top: 19px;
-        margin-left: 8px;
-        color: {COLOR_GRIS};
-        font-size: 13px;
-        font-weight: 800;
-        letter-spacing: .06em;
-    }}
-</style>
-</head>
-
-<body>
-<div class="card {clase_extra}">
-    <div class="visual">
-        {visual}
-    </div>
-
-    <div class="top-brand">
-        <span class="dot">●</span> Miri te lo cuenta
-    </div>
-
-    <div class="spark">✦</div>
-    <div class="accent-line"></div>
-
-    <section class="footer">
-        <div class="copy">
-            <div class="pill">{categoria_safe}</div>
-            <div class="headline">{titulo_safe}</div>
-        </div>
-
-        <div class="logo-area">
-            <div class="logo-miri">Miri</div>
-            <div class="bubble">te lo cuenta</div>
-            <div class="handle">@miritelocuenta</div>
-        </div>
-    </section>
-</div>
-</body>
-</html>'''
-
-
-def renderizar_html_a_png(html_doc, ruta_salida):
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception as e:
-        print(f"❌ Playwright no está disponible: {e}")
-        return None
-
-    if os.path.exists(ruta_salida):
+    # Fondo
+    if (
+        ruta_imagen_real
+        and os.path.exists(
+            ruta_imagen_real
+        )
+    ):
         try:
-            os.remove(ruta_salida)
+            with Image.open(
+                ruta_imagen_real
+            ) as base_img:
+                fondo = ajustar_cobertura(
+                    base_img,
+                    W,
+                    H
+                )
         except Exception:
-            pass
+            fondo = crear_fondo_fallback(
+                (W, H)
+            )
+    else:
+        fondo = crear_fondo_fallback(
+            (W, H)
+        )
 
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-gpu",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ]
+    fondo = fondo.convert(
+        "RGBA"
+    )
+
+    # Suave capa cálida solo en zona visual.
+    tint = Image.new(
+        "RGBA",
+        (W, TOP_H),
+        (255, 247, 239, 25)
+    )
+
+    fondo.alpha_composite(
+        tint,
+        (0, 0)
+    )
+
+    draw = ImageDraw.Draw(
+        fondo
+    )
+
+    # Gradiente oscuro suave al final de la foto.
+    grad = Image.new(
+        "RGBA",
+        (W, TOP_H),
+        (0, 0, 0, 0)
+    )
+
+    gd = ImageDraw.Draw(
+        grad
+    )
+
+    for y in range(TOP_H):
+        inicio = int(
+            TOP_H * 0.55
+        )
+
+        if y < inicio:
+            alpha = 0
+        else:
+            progreso = (
+                y - inicio
+            ) / max(
+                1,
+                TOP_H - inicio
             )
 
-            page = browser.new_page(
-                viewport={"width": 1200, "height": 630},
-                device_scale_factor=1
+            alpha = int(
+                105
+                * progreso
             )
 
-            page.set_content(
-                html_doc,
-                wait_until="load"
+        gd.line(
+            (
+                0,
+                y,
+                W,
+                y
+            ),
+            fill=(
+                14,
+                14,
+                16,
+                alpha
+            )
+        )
+
+    fondo.alpha_composite(
+        grad,
+        (0, 0)
+    )
+
+    draw = ImageDraw.Draw(
+        fondo
+    )
+
+    # Faldón negro.
+    draw.rectangle(
+        (
+            0,
+            H - BOTTOM_H,
+            W,
+            H
+        ),
+        fill=COLOR_BLACK
+    )
+
+    # Línea coral superior del faldón.
+    draw.rectangle(
+        (
+            0,
+            H - BOTTOM_H,
+            W,
+            H - BOTTOM_H + 12
+        ),
+        fill=COLOR_RED
+    )
+
+    # Fuentes
+    font_top = cargar_fuente(
+        19,
+        bold=True
+    )
+
+    font_cat = cargar_fuente(
+        17,
+        bold=True
+    )
+
+    # Ajuste adaptativo del titular
+    title_len = len(
+        titulo_miniatura
+        or ""
+    )
+
+    if title_len <= 34:
+        title_size = 52
+    elif title_len <= 52:
+        title_size = 46
+    elif title_len <= 72:
+        title_size = 40
+    else:
+        title_size = 36
+
+    font_title = cargar_fuente(
+        title_size,
+        bold=True
+    )
+
+    font_brand_big = cargar_fuente(
+        58,
+        bold=True
+    )
+
+    font_brand_mid = cargar_fuente(
+        20,
+        bold=True
+    )
+
+    font_brand_small = cargar_fuente(
+        15,
+        bold=True
+    )
+
+    # Etiqueta superior izquierda.
+    draw_pill(
+        draw,
+        28,
+        22,
+        "• MIRI TE LO CUENTA",
+        font_top,
+        fill=COLOR_YELLOW,
+        text_fill=COLOR_BLACK,
+        outline=COLOR_BLACK,
+        padding_x=18,
+        padding_y=7
+    )
+
+    # Decoración de puntos arriba derecha.
+    for row in range(8):
+        for col in range(14):
+            x = 945 + col * 16
+            y = 10 + row * 16
+
+            draw.ellipse(
+                (
+                    x-1,
+                    y-1,
+                    x+1,
+                    y+1
+                ),
+                fill="#F1DB82"
             )
 
-            page.wait_for_function(
-                """() => Array.from(document.images)
-                    .every(img => img.complete)""",
-                timeout=5000
+    # Categoría.
+    categoria_visual = (
+        categoria_visual
+        or "ACTUALIDAD"
+    ).upper().strip()
+
+    draw_pill(
+        draw,
+        55,
+        H - BOTTOM_H + 42,
+        categoria_visual,
+        font_cat,
+        fill=COLOR_YELLOW,
+        text_fill=COLOR_BLACK,
+        outline=None,
+        padding_x=15,
+        padding_y=7
+    )
+
+    # Línea coral vertical.
+    draw.rounded_rectangle(
+        (
+            24,
+            H - BOTTOM_H + 91,
+            31,
+            H - 48
+        ),
+        radius=3,
+        fill=COLOR_RED
+    )
+
+    # Titular.
+    titulo_miniatura = limitar_texto(
+        titulo_miniatura
+        or "Noticia destacada",
+        95
+    )
+
+    titulo_x = 55
+    titulo_y = (
+        H
+        - BOTTOM_H
+        + 94
+    )
+
+    max_title_width = 720
+
+    title_lines = envolver_texto(
+        draw,
+        titulo_miniatura,
+        font_title,
+        max_title_width
+    )
+
+    if len(title_lines) > 3:
+        title_lines = title_lines[:3]
+
+        ultima = (
+            title_lines[-1]
+        )
+
+        while ultima:
+            prueba = ultima + "…"
+
+            bbox = draw.textbbox(
+                (0, 0),
+                prueba,
+                font=font_title
             )
 
-            page.wait_for_timeout(250)
+            if (
+                bbox[2]
+                - bbox[0]
+                <= max_title_width
+            ):
+                break
 
-            card = page.locator(".card")
-            card.screenshot(
-                path=ruta_salida,
-                type="png",
-                animations="disabled"
+            ultima = ultima[:-1].rstrip()
+
+        title_lines[-1] = (
+            ultima + "…"
+        )
+
+    line_height = int(
+        title_size * 1.08
+    )
+
+    for i, line in enumerate(
+        title_lines
+    ):
+        draw.text(
+            (
+                titulo_x,
+                titulo_y
+                + i * line_height
+            ),
+            line,
+            font=font_title,
+            fill=COLOR_WHITE
+        )
+
+    # Marca a la derecha.
+    brand_x = 900
+    brand_y = (
+        H
+        - BOTTOM_H
+        + 58
+    )
+
+    draw.text(
+        (
+            brand_x,
+            brand_y
+        ),
+        "Miri",
+        font=font_brand_big,
+        fill=COLOR_WHITE
+    )
+
+    # Bocadillo coral.
+    bubble_x = brand_x
+    bubble_y = brand_y + 72
+    bubble_w = 158
+    bubble_h = 55
+
+    draw.rounded_rectangle(
+        (
+            bubble_x,
+            bubble_y,
+            bubble_x + bubble_w,
+            bubble_y + bubble_h
+        ),
+        radius=13,
+        fill=COLOR_RED
+    )
+
+    draw.polygon(
+        [
+            (
+                bubble_x + 24,
+                bubble_y + bubble_h
+            ),
+            (
+                bubble_x + 42,
+                bubble_y + bubble_h
+            ),
+            (
+                bubble_x + 27,
+                bubble_y + bubble_h + 15
             )
+        ],
+        fill=COLOR_RED
+    )
 
-            browser.close()
+    draw.text(
+        (
+            bubble_x + 16,
+            bubble_y + 13
+        ),
+        "te lo cuenta",
+        font=font_brand_mid,
+        fill=COLOR_WHITE
+    )
 
-        if os.path.exists(ruta_salida) and os.path.getsize(ruta_salida) > 1000:
-            print(
-                f"✅ Miniatura generada correctamente: "
-                f"{ruta_salida} (1200x630)"
-            )
-            return ruta_salida
+    draw.text(
+        (
+            brand_x,
+            bubble_y + 73
+        ),
+        "@miritelocuenta",
+        font=font_brand_small,
+        fill=COLOR_LIGHT_GREY
+    )
 
-        print("❌ La miniatura no se creó correctamente.")
+    # Arco coral abajo derecha.
+    draw.arc(
+        (
+            1035,
+            472,
+            1325,
+            760
+        ),
+        start=180,
+        end=310,
+        fill=COLOR_RED,
+        width=12
+    )
 
-    except Exception as e:
-        print(f"❌ Error renderizando miniatura: {e}")
+    final_rgb = fondo.convert(
+        "RGB"
+    )
 
-    return None
+    final_rgb.save(
+        ruta_salida,
+        format="JPEG",
+        quality=92,
+        optimize=True
+    )
+
+    return ruta_salida
 
 
-def generar_miniatura_html(
+# ==========================================
+# 18. CRÉDITO DE LA IMAGEN
+# ==========================================
+def construir_credito_html(
+    info_imagen
+):
+    if not info_imagen:
+        return ""
+
+    title = html.escape(
+        info_imagen.get(
+            "title",
+            "Imagen"
+        )
+    )
+
+    author = html.escape(
+        info_imagen.get(
+            "artist",
+            "Autor no indicado"
+        )
+        or "Autor no indicado"
+    )
+
+    license_name = html.escape(
+        info_imagen.get(
+            "license",
+            "Licencia no indicada"
+        )
+        or "Licencia no indicada"
+    )
+
+    source_url = (
+        info_imagen.get(
+            "source_page",
+            ""
+        )
+        or ""
+    ).strip()
+
+    source_name = (
+        "Wikimedia Commons"
+        if info_imagen.get("engine")
+        == "wikimedia"
+        else "Openverse"
+    )
+
+    source_html = (
+        html.escape(
+            source_name
+        )
+    )
+
+    if source_url:
+        source_html = (
+            f'<a href="{html.escape(source_url, quote=True)}" '
+            f'target="_blank" rel="noopener noreferrer">'
+            f'{html.escape(source_name)}</a>'
+        )
+
+    license_url = (
+        info_imagen.get(
+            "license_url",
+            ""
+        )
+        or ""
+    )
+
+    license_html = license_name
+
+    if license_url:
+        license_html = (
+            f'<a href="{html.escape(license_url, quote=True)}" '
+            f'target="_blank" rel="noopener noreferrer">'
+            f'{license_name}</a>'
+        )
+
+    return (
+        '<p style="font-size:11px;color:#888;'
+        'margin-top:12px;line-height:1.45;">'
+        f'Imagen destacada: {title}. '
+        f'Autor: {author}. '
+        f'Fuente: {source_html}. '
+        f'Licencia: {license_html}.'
+        '</p>'
+    )
+
+
+# ==========================================
+# 19. GENERACIÓN DE MINIATURA
+# ==========================================
+def generar_miniatura(
     titulo_miniatura,
     categoria_visual,
     tipo_visual,
@@ -1465,147 +2880,134 @@ def generar_miniatura_html(
     contexto_visual,
     busquedas_imagen
 ):
-    ruta_local = "miniatura_destacada.png"
+    ruta_local = OUTPUT_IMAGE
 
-    if os.path.exists(ruta_local):
+    # Evita reutilizar una miniatura previa.
+    if os.path.exists(
+        ruta_local
+    ):
         try:
-            os.remove(ruta_local)
+            os.remove(
+                ruta_local
+            )
         except Exception:
             pass
 
-    print("🎨 Preparando miniatura de Miri te lo cuenta...")
-    print(f"🧩 Tipo visual: {tipo_visual}")
-    print(f"🎯 Entidad principal: {entidad_principal}")
-    print(f"🧭 Contexto visual: {contexto_visual}")
-    print(f"🔍 Búsquedas: {busquedas_imagen}")
-
-    info_imagen, image_data_uri = seleccionar_mejor_imagen(
-        tipo_visual=tipo_visual,
-        entidad_principal=entidad_principal,
-        contexto_visual=contexto_visual,
-        busquedas_imagen=busquedas_imagen
+    ruta_imagen_real, info_imagen = (
+        seleccionar_mejor_imagen_real(
+            tipo_visual=tipo_visual,
+            entidad_principal=entidad_principal,
+            contexto_visual=contexto_visual,
+            busquedas_imagen=busquedas_imagen
+        )
     )
 
-    if info_imagen and image_data_uri:
-        print("✅ Se usará una imagen validada por relevancia.")
-    else:
-        print(
-            "ℹ️ Se usará el fondo gráfico de marca porque "
-            "no hay una imagen suficientemente fiable."
-        )
-
-    html_doc = crear_html_miniatura(
+    crear_miniatura_brandeada(
         titulo_miniatura=titulo_miniatura,
         categoria_visual=categoria_visual,
-        image_data_uri=image_data_uri
+        ruta_salida=ruta_local,
+        ruta_imagen_real=ruta_imagen_real
     )
 
-    ruta_generada = renderizar_html_a_png(
-        html_doc,
-        ruta_local
-    )
-
-    if not ruta_generada:
-        return None, None
-
-    return ruta_generada, info_imagen
-
-
-def construir_credito_html(info_imagen):
-    if not info_imagen:
-        return ""
-
-    author = html.escape(
-        info_imagen.get("author") or "Autor no indicado"
-    )
-    source = html.escape(
-        info_imagen.get("source") or "Fuente pública"
-    )
-    license_name = html.escape(
-        info_imagen.get("license") or "Licencia abierta"
-    )
-
-    page_url = info_imagen.get("page_url") or ""
-    license_url = info_imagen.get("license_url") or ""
-
-    partes = [f"Imagen destacada: {author}"]
-
-    if page_url:
-        partes.append(
-            f'<a href="{html.escape(page_url, quote=True)}" '
-            f'target="_blank" rel="noopener noreferrer">'
-            f'{source}</a>'
+    # Limpieza de temporal.
+    if (
+        ruta_imagen_real
+        and os.path.exists(
+            ruta_imagen_real
         )
-    else:
-        partes.append(source)
+    ):
+        try:
+            os.remove(
+                ruta_imagen_real
+            )
+        except Exception:
+            pass
 
-    if license_url:
-        partes.append(
-            f'<a href="{html.escape(license_url, quote=True)}" '
-            f'target="_blank" rel="noopener noreferrer">'
-            f'{license_name}</a>'
-        )
-    else:
-        partes.append(license_name)
+    print(
+        "✅ Miniatura visual generada correctamente."
+    )
 
     return (
-        '<p style="font-size:11px; color:#888; '
-        'margin-top:18px; line-height:1.45;">'
-        + " · ".join(partes)
-        + "</p>"
+        ruta_local,
+        info_imagen
     )
 
 
 # ==========================================
-# 5. PUBLICACIÓN EN WORDPRESS
+# 20. WORDPRESS
 # ==========================================
 def publicar_en_wordpress(
     titulo,
     contenido_html,
     ruta_imagen
 ):
-    if not (WP_URL and WP_USER and WP_APP_PASS):
+    if not (
+        WP_URL
+        and WP_USER
+        and WP_APP_PASS
+    ):
         raise Exception(
-            "❌ Error crítico: Faltan credenciales "
+            "❌ Error crítico: faltan credenciales "
             "de WordPress en Secrets."
         )
 
     media_id = None
 
-    if ruta_imagen and os.path.exists(ruta_imagen):
+    if (
+        ruta_imagen
+        and os.path.exists(
+            ruta_imagen
+        )
+    ):
         print(
             f"🚀 Subiendo imagen destacada a {WP_URL}..."
         )
 
-        url_media = f"{WP_URL}/wp-json/wp/v2/media"
+        url_media = (
+            f"{WP_URL}/wp-json/wp/v2/media"
+        )
 
-        with open(ruta_imagen, "rb") as f:
+        with open(
+            ruta_imagen,
+            "rb"
+        ) as f:
             media_bytes = f.read()
 
-        content_type = (
-            mimetypes.guess_type(ruta_imagen)[0]
-            or "image/png"
+        guessed_mime = (
+            mimetypes.guess_type(
+                ruta_imagen
+            )[0]
+            or "image/jpeg"
         )
 
         headers_media = {
             "Content-Disposition": (
-                "attachment; "
-                f"filename={os.path.basename(ruta_imagen)}"
+                f'attachment; filename="'
+                f'{os.path.basename(ruta_imagen)}"'
             ),
-            "Content-Type": content_type
+            "Content-Type": guessed_mime
         }
 
         r_media = requests.post(
             url_media,
             data=media_bytes,
             headers=headers_media,
-            auth=(WP_USER, WP_APP_PASS),
-            timeout=30
+            auth=(
+                WP_USER,
+                WP_APP_PASS
+            ),
+            timeout=40
         )
 
-        if r_media.status_code in [200, 201]:
+        if r_media.status_code in [
+            200,
+            201
+        ]:
             media_json = r_media.json()
-            media_id = media_json.get("id")
+
+            media_id = media_json.get(
+                "id"
+            )
 
             print(
                 "✅ Imagen subida correctamente "
@@ -1615,21 +3017,17 @@ def publicar_en_wordpress(
         else:
             print(
                 "⚠️ Aviso al subir imagen a WordPress: "
+                f"{r_media.status_code} - "
                 f"{r_media.text}"
             )
 
-    else:
-        print(
-            "⚠️ No hay miniatura válida. "
-            "El artículo se publicará sin imagen destacada."
-        )
-
     print(
-        "🚀 Publicando artículo completo con su miniatura "
-        "en WordPress..."
+        "🚀 Publicando artículo completo con su miniatura..."
     )
 
-    url_posts = f"{WP_URL}/wp-json/wp/v2/posts"
+    url_posts = (
+        f"{WP_URL}/wp-json/wp/v2/posts"
+    )
 
     payload = {
         "title": titulo,
@@ -1638,34 +3036,45 @@ def publicar_en_wordpress(
     }
 
     if media_id:
-        payload["featured_media"] = media_id
+        payload[
+            "featured_media"
+        ] = media_id
 
     r_post = requests.post(
         url_posts,
         json=payload,
-        headers={"Content-Type": "application/json"},
-        auth=(WP_USER, WP_APP_PASS),
-        timeout=30
+        headers={
+            "Content-Type": "application/json"
+        },
+        auth=(
+            WP_USER,
+            WP_APP_PASS
+        ),
+        timeout=40
     )
 
-    if r_post.status_code in [200, 201]:
+    if r_post.status_code in [
+        200,
+        201
+    ]:
         post_data = r_post.json()
 
         print(
-            "🎉 ¡ÉXITO TOTAL! Entrada publicada en "
-            f"WordPress. Link: {post_data.get('link')}"
+            "🎉 ¡ÉXITO TOTAL! Entrada publicada. "
+            f"Link: {post_data.get('link')}"
         )
 
         return True
 
     raise Exception(
         "❌ Error crítico al publicar entrada "
-        f"({r_post.status_code}): {r_post.text}"
+        f"({r_post.status_code}): "
+        f"{r_post.text}"
     )
 
 
 # ==========================================
-# 6. EJECUCIÓN PRINCIPAL
+# 21. EJECUCIÓN PRINCIPAL
 # ==========================================
 if __name__ == "__main__":
     tema = obtener_nuevo_tema_viral()
@@ -1674,30 +3083,72 @@ if __name__ == "__main__":
         print(
             "⚠️ Sin temas nuevos. Usando tema de prueba..."
         )
-        tema = "Polémica viral de la semana en redes sociales"
 
-    print(f"🔥 Tema seleccionado: {tema}")
+        tema = (
+            "Polémica viral de la semana "
+            "en redes sociales"
+        )
 
-    (
-        titulo,
-        contenido_html,
-        titulo_miniatura,
-        categoria_visual,
-        tipo_visual,
-        entidad_principal,
-        contexto_visual,
-        busquedas_imagen
-    ) = generar_articulo_miri(tema)
+    print(
+        f"🔥 Tema seleccionado: {tema}"
+    )
 
-    print(f"📰 Título artículo: {titulo}")
-    print(f"🖼️ Título miniatura: {titulo_miniatura}")
-    print(f"🏷️ Categoría visual: {categoria_visual}")
-    print(f"🧩 Tipo visual: {tipo_visual}")
-    print(f"🎯 Entidad principal: {entidad_principal}")
-    print(f"🧭 Contexto visual: {contexto_visual}")
-    print(f"🔎 Búsquedas imagen: {busquedas_imagen}")
+    articulo = generar_articulo_miri(
+        tema
+    )
 
-    ruta_imagen, info_imagen = generar_miniatura_html(
+    titulo = articulo[
+        "titulo"
+    ]
+
+    contenido_html = articulo[
+        "contenido_html"
+    ]
+
+    titulo_miniatura = articulo[
+        "titulo_miniatura"
+    ]
+
+    categoria_visual = articulo[
+        "categoria_visual"
+    ]
+
+    tipo_visual = articulo[
+        "tipo_visual"
+    ]
+
+    entidad_principal = articulo[
+        "entidad_principal"
+    ]
+
+    contexto_visual = articulo[
+        "contexto_visual"
+    ]
+
+    busquedas_imagen = articulo[
+        "busquedas_imagen"
+    ]
+
+    print(
+        f"📰 Título artículo: {titulo}"
+    )
+    print(
+        f"🖼️ Título miniatura: {titulo_miniatura}"
+    )
+    print(
+        f"🧩 Tipo visual: {tipo_visual}"
+    )
+    print(
+        f"🎯 Entidad principal: {entidad_principal}"
+    )
+    print(
+        f"🧭 Contexto visual: {contexto_visual}"
+    )
+    print(
+        f"🔎 Búsquedas imagen: {busquedas_imagen}"
+    )
+
+    ruta_imagen, info_imagen = generar_miniatura(
         titulo_miniatura=titulo_miniatura,
         categoria_visual=categoria_visual,
         tipo_visual=tipo_visual,
@@ -1722,4 +3173,6 @@ if __name__ == "__main__":
         )
 
         if publicado:
-            guardar_en_historial(tema)
+            guardar_en_historial(
+                tema
+            )
