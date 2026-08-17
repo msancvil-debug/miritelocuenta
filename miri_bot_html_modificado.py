@@ -2215,7 +2215,11 @@ Si ninguno merece publicarse, usa id=-1.
                     candidatos[:55]
                 )
             ):
-                return None
+                print(
+                    "⚠️ Gemini no eligió una candidata válida; "
+                    "se usará el mejor candidato por puntuación."
+                )
+                break
 
             elegido = dict(
                 candidatos[
@@ -2309,9 +2313,9 @@ Si ninguno merece publicarse, usa id=-1.
             if repeticion:
                 print(
                     "⚠️ Gemini eligió un tema demasiado repetido; "
-                    "se descarta."
+                    "se probará otro candidato."
                 )
-                return None
+                break
 
             elegido[
                 "score_tendencia"
@@ -2396,6 +2400,8 @@ def obtener_nuevo_tema_viral():
         )
     )
 
+    respaldos_validos = []
+
     for numero in range(
         1,
         intentos + 1
@@ -2403,6 +2409,19 @@ def obtener_nuevo_tema_viral():
         elegido = seleccionar_mejor_tendencia_gemini(
             restantes
         )
+
+        if not elegido:
+            # Fallback directo al mejor candidato no repetido.
+            elegido = next(
+                (
+                    dict(c)
+                    for c in restantes
+                    if not c.get(
+                        "repeticion_dura"
+                    )
+                ),
+                None
+            )
 
         if not elegido:
             break
@@ -2445,58 +2464,117 @@ def obtener_nuevo_tema_viral():
                 "_investigacion_verificada"
             ] = investigacion
 
-            print(
-                "✅ Tendencia verificada: "
-                f"{elegido.get('titulo')}"
-            )
+            elegido[
+                "_modo_verificacion"
+            ] = "estricto"
 
             print(
-                "   Fuentes reales Google: "
-                f"{len(investigacion.get('_grounding_sources', []))}"
+                "✅ Tendencia verificada de forma estricta: "
+                f"{elegido.get('titulo')}"
             )
 
             return elegido
 
         print(
-            "🚫 Tendencia descartada tras verificar: "
+            "⚠️ Verificación estricta no superada: "
             f"{motivo}"
         )
 
-        # Elimina la candidata rechazada y vuelve a elegir.
-        titulo_rechazado = normalizar_texto(
-            elegido.get(
-                "titulo_original_detectado",
-                ""
+        respaldo_ok, motivo_respaldo = (
+            investigacion_es_publicable_respaldo(
+                investigacion,
+                elegido
             )
-            or elegido.get(
+        )
+
+        if respaldo_ok:
+            investigacion_respaldo = preparar_investigacion_respaldo(
+                investigacion,
+                elegido
+            )
+
+            respaldos_validos.append(
+                (
+                    elegido,
+                    investigacion_respaldo
+                )
+            )
+
+            print(
+                "✅ La candidata queda disponible como respaldo "
+                "porque sí tiene evidencia real."
+            )
+        else:
+            print(
+                "🚫 También descartada como respaldo: "
+                f"{motivo_respaldo}"
+            )
+
+        # Quitar la candidata ya evaluada.
+        titulo_elegido = normalizar_texto(
+            elegido.get(
                 "titulo",
                 ""
             )
         )
 
-        nuevos = []
-
-        for c in restantes:
+        restantes = [
+            c
+            for c in restantes
             if normalizar_texto(
                 c.get(
                     "titulo",
                     ""
                 )
-            ) == titulo_rechazado:
-                continue
-
-            nuevos.append(
-                c
-            )
-
-        restantes = nuevos
+            ) != titulo_elegido
+        ]
 
         if not restantes:
             break
 
+    # Si ninguna pasó el listón estricto pero sí tenemos una
+    # historia REAL con fuente, publicamos la mejor.
+    if respaldos_validos:
+        elegido, investigacion = respaldos_validos[0]
+
+        tema_corregido = (
+            investigacion.get(
+                "tema_corregido",
+                ""
+            )
+            or ""
+        ).strip()
+
+        if tema_corregido:
+            elegido[
+                "titulo_original_detectado"
+            ] = elegido.get(
+                "titulo",
+                ""
+            )
+
+            elegido[
+                "titulo"
+            ] = tema_corregido
+
+        elegido[
+            "_investigacion_verificada"
+        ] = investigacion
+
+        elegido[
+            "_modo_verificacion"
+        ] = "respaldo"
+
+        print(
+            "🟡 Se publicará con verificación de respaldo: "
+            f"{elegido.get('titulo')}"
+        )
+
+        return elegido
+
     print(
-        "⚠️ Ninguna tendencia sobrevivió la verificación. "
-        "No se publicará relleno ni una moda inventada."
+        "⚠️ No hay ninguna historia verificable con fuente real. "
+        "Esta ejecución no publicará."
     )
 
     return None
@@ -2586,6 +2664,10 @@ confianza: 0-100.
 def investigacion_es_publicable(
     investigacion
 ):
+    """
+    Validación ESTRICTA.
+    Se intenta siempre primero.
+    """
     if not isinstance(
         investigacion,
         dict
@@ -2645,6 +2727,279 @@ def investigacion_es_publicable(
 
     return True, "ok"
 
+
+def _fuentes_investigacion(
+    investigacion
+):
+    fuentes = []
+
+    if not isinstance(
+        investigacion,
+        dict
+    ):
+        return fuentes
+
+    for item in (
+        investigacion.get(
+            "_grounding_sources",
+            []
+        )
+        or []
+    ):
+        if isinstance(
+            item,
+            dict
+        ):
+            url = (
+                item.get(
+                    "url",
+                    ""
+                )
+                or ""
+            ).strip()
+
+            nombre = (
+                item.get(
+                    "titulo",
+                    ""
+                )
+                or ""
+            ).strip()
+
+            if url:
+                fuentes.append({
+                    "nombre": nombre,
+                    "url": url,
+                })
+
+    for item in asegurar_lista(
+        investigacion.get(
+            "fuentes",
+            []
+        )
+    ):
+        if isinstance(
+            item,
+            dict
+        ):
+            url = (
+                item.get(
+                    "url",
+                    ""
+                )
+                or ""
+            ).strip()
+
+            nombre = (
+                item.get(
+                    "nombre",
+                    ""
+                )
+                or ""
+            ).strip()
+
+            if url:
+                fuentes.append({
+                    "nombre": nombre,
+                    "url": url,
+                })
+
+    # Deduplicar por URL.
+    vistos = set()
+    salida = []
+
+    for item in fuentes:
+        url = item.get(
+            "url",
+            ""
+        )
+
+        if (
+            url
+            and url not in vistos
+        ):
+            vistos.add(
+                url
+            )
+            salida.append(
+                item
+            )
+
+    return salida
+
+
+def investigacion_es_publicable_respaldo(
+    investigacion,
+    tendencia
+):
+    """
+    Respaldo para que el bot no deje de publicar solo porque
+    Gemini/Google Search no devuelva groundingMetadata.
+
+    NO acepta una ocurrencia inventada por el módulo social.
+    Exige:
+    - historia verificable;
+    - información concreta;
+    - y evidencia de una fuente real o de varias señales/fuentes
+      recogidas por Google News/RSS/Trends.
+    """
+    if not isinstance(
+        investigacion,
+        dict
+    ):
+        return False, "sin investigación"
+
+    verificable = investigacion.get(
+        "verificable"
+    )
+
+    if verificable is not True:
+        return False, "la historia no se verificó como real"
+
+    try:
+        confianza = int(
+            investigacion.get(
+                "confianza",
+                0
+            )
+        )
+    except Exception:
+        confianza = 0
+
+    if confianza < 55:
+        return False, f"confianza de respaldo insuficiente ({confianza})"
+
+    hechos = asegurar_lista(
+        investigacion.get(
+            "hechos_confirmados",
+            []
+        )
+    )
+
+    if not hechos:
+        return False, "sin hechos confirmados"
+
+    fuentes_investigacion = _fuentes_investigacion(
+        investigacion
+    )
+
+    url_candidata = (
+        tendencia.get(
+            "url",
+            ""
+        )
+        or ""
+    ).strip()
+
+    fuentes_candidata = deduplicar_lista(
+        asegurar_lista(
+            tendencia.get(
+                "fuentes",
+                []
+            )
+        )
+    )
+
+    senales = deduplicar_lista(
+        asegurar_lista(
+            tendencia.get(
+                "senales",
+                []
+            )
+        )
+    )
+
+    # Las sugerencias puramente sociales de Gemini NO pueden
+    # pasar por el respaldo si no hay una fuente web concreta.
+    es_solo_social_gemini = (
+        senales
+        and all(
+            str(s).strip().lower() == "google_search_social"
+            for s in senales
+        )
+        and not url_candidata
+        and not fuentes_investigacion
+    )
+
+    if es_solo_social_gemini:
+        return False, "candidata social sin fuente independiente"
+
+    if (
+        fuentes_investigacion
+        or url_candidata
+        or len(
+            fuentes_candidata
+        ) >= 2
+    ):
+        return True, "respaldo con fuente real"
+
+    return False, "sin evidencia externa suficiente"
+
+
+def preparar_investigacion_respaldo(
+    investigacion,
+    tendencia
+):
+    """
+    Completa la investigación con la fuente original de la
+    candidata para que el redactor tenga contexto factual.
+    """
+    salida = dict(
+        investigacion
+        if isinstance(
+            investigacion,
+            dict
+        )
+        else {}
+    )
+
+    fuentes = _fuentes_investigacion(
+        salida
+    )
+
+    url = (
+        tendencia.get(
+            "url",
+            ""
+        )
+        or ""
+    ).strip()
+
+    fuente_nombre = (
+        tendencia.get(
+            "fuente",
+            ""
+        )
+        or ""
+    ).strip()
+
+    if url and not any(
+        f.get(
+            "url"
+        ) == url
+        for f in fuentes
+    ):
+        fuentes.append({
+            "nombre": fuente_nombre,
+            "url": url,
+        })
+
+    if fuentes:
+        salida[
+            "fuentes"
+        ] = fuentes
+
+    # Si Google confirma que la historia es real pero no que sea
+    # literalmente una "tendencia", el artículo podrá publicarse
+    # como actualidad/Internet sin llamarla tendencia.
+    if salida.get(
+        "es_tendencia_real"
+    ) is not True:
+        salida[
+            "es_tendencia_real"
+        ] = False
+
+    return salida
 
 
 
@@ -2724,6 +3079,8 @@ IMPORTANTE:
 - No inventes declaraciones textuales.
 - NO llames a algo "moda", "reto", "tendencia" o "viral" salvo que la
   investigación verificada confirme expresamente que lo es.
+- Si la historia está verificada pero es_tendencia_real=false,
+  trátala como noticia/actualidad de Internet, no como "tendencia".
 - No transformes un consejo, un vídeo aislado o un artículo evergreen
   en una supuesta tendencia de TikTok.
 - Evita titulares que den asco, ridiculicen o exageren si eso no está
@@ -5398,7 +5755,15 @@ if __name__ == "__main__":
     )
 
     if not puede_publicar_ahora():
+        print(
+            "ℹ️ Fin normal: esta ejecución queda bloqueada "
+            "únicamente por el intervalo/cuota."
+        )
         raise SystemExit(0)
+
+    print(
+        "✅ La frecuencia permite publicar en esta ejecución."
+    )
 
     tendencia = obtener_nuevo_tema_viral()
 
@@ -5417,9 +5782,20 @@ if __name__ == "__main__":
         {}
     )
 
-    publicable, motivo = investigacion_es_publicable(
-        investigacion
+    modo_verificacion = tendencia.get(
+        "_modo_verificacion",
+        "estricto"
     )
+
+    if modo_verificacion == "respaldo":
+        publicable, motivo = investigacion_es_publicable_respaldo(
+            investigacion,
+            tendencia
+        )
+    else:
+        publicable, motivo = investigacion_es_publicable(
+            investigacion
+        )
 
     if not publicable:
         print(
@@ -5427,6 +5803,11 @@ if __name__ == "__main__":
             f"Motivo: {motivo}"
         )
         raise SystemExit(0)
+
+    print(
+        "🛡️ Modo de verificación editorial: "
+        f"{modo_verificacion}"
+    )
 
     articulo = generar_articulo_miri(
         tema,
