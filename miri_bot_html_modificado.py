@@ -59,9 +59,6 @@ INTERVALO_PUBLICACION_HORAS = float(
     )
 )
 
-# GitHub Actions define GITHUB_EVENT_NAME automáticamente.
-# workflow_dispatch = has pulsado "Run workflow".
-# schedule = ejecución automática programada.
 GITHUB_EVENT_NAME = str(
     os.environ.get(
         "GITHUB_EVENT_NAME",
@@ -79,12 +76,6 @@ try:
 except Exception:
     GITHUB_RUN_ATTEMPT = 1
 
-# Permitir prueba inmediata tanto si:
-# - pulsas "Run workflow" (workflow_dispatch), como si
-# - pulsas "Re-run jobs" sobre una ejecución anterior (run_attempt > 1).
-#
-# Una ejecución automática nueva de schedule sigue teniendo attempt=1
-# y por tanto mantiene las 37,2 horas.
 EJECUCION_MANUAL_GITHUB = (
     GITHUB_EVENT_NAME == "workflow_dispatch"
     or GITHUB_RUN_ATTEMPT > 1
@@ -246,6 +237,50 @@ def limitar_texto(texto, max_len=95):
         return texto
 
     return texto[:max_len - 1].rstrip() + "…"
+
+
+def construir_titulo_social(titulo_articulo, tema_viral):
+    """
+    Genera los primeros caracteres del artículo para que sirvan
+    como texto buscable en YouTube, TikTok, Instagram y Facebook,
+    SIN tocar el prompt ni la lógica del generador de imágenes.
+    """
+    titulo_articulo = re.sub(
+        r"\s+",
+        " ",
+        str(titulo_articulo or "").strip()
+    )
+
+    tema_viral = re.sub(
+        r"\s+",
+        " ",
+        str(tema_viral or "").strip()
+    )
+
+    base = titulo_articulo or tema_viral
+
+    if len(base) < 80 and tema_viral and base.lower() not in tema_viral.lower():
+        candidato = f"{base} — {tema_viral}"
+
+        if len(candidato) <= 100:
+            base = candidato
+
+    base = re.sub(
+        r"\s+",
+        " ",
+        base
+    ).strip()
+
+    # Máximo 100 caracteres.
+    if len(base) > 100:
+        recorte = base[:100]
+
+        if " " in recorte:
+            recorte = recorte.rsplit(" ", 1)[0]
+
+        base = recorte.rstrip(" ,;:-")
+
+    return base
 
 
 def extraer_json_de_respuesta(raw_text):
@@ -636,30 +671,11 @@ IMPORTANTE:
 - Responde ÚNICAMENTE con un objeto JSON válido.
 - No uses Markdown.
 
-MUY IMPORTANTE PARA REDES SOCIALES:
-- Genera también "titulo_social".
-- Debe tener entre 80 y 100 caracteres y NUNCA superar 100.
-- Ese texto será el PRIMER texto visible del artículo de WordPress.
-- Esos primeros caracteres se usarán como título en YouTube,
-  TikTok, Instagram y Facebook.
-- Optimízalo para las búsquedas de esas redes:
-  pon al principio el nombre exacto de la persona, programa,
-  reality, creador, plataforma o tema principal.
-- Incluye palabras que una persona escribiría realmente al buscar
-  esa noticia o ese tema.
-- No empieces con frases genéricas como "Hola", "Agárrate",
-  "Internet se vuelve loco" o "Miri te lo cuenta".
-- No uses hashtags.
-- Debe describir claramente el tema y no ser solo clickbait.
-- El PRIMER párrafo de contenido_html debe contener ÚNICAMENTE
-  titulo_social. Después empieza el desarrollo normal del artículo.
-
 Devuelve EXACTAMENTE:
 
 {{
   "titulo": "Titular llamativo y claro",
-  "titulo_social": "80-100 caracteres buscables sobre el tema exacto",
-  "contenido_html": "<p>TÍTULO SOCIAL</p><p>Desarrollo del artículo...</p>",
+  "contenido_html": "<p>Primer párrafo...</p><p>Segundo párrafo...</p>",
   "titulo_miniatura": "TITULAR CORTO PARA LA MINIATURA",
   "categoria_visual": "VIRAL / REDES / TELECINCO / REALITY / ACTUALIDAD",
   "tipo_visual": "persona | programa | marca | evento | lugar | tema",
@@ -795,60 +811,6 @@ REGLAS EDITORIALES PARA ELEGIR LA IMAGEN:
                 ""
             )
 
-            titulo_social = html.unescape(
-                articulo.get(
-                    "titulo_social",
-                    ""
-                )
-            ).strip()
-
-            if not titulo_social:
-                titulo_social = titulo
-
-            titulo_social = re.sub(
-                r"\s+",
-                " ",
-                titulo_social
-            ).strip()
-
-            # Máximo 100 caracteres, sin cortar una palabra.
-            if len(titulo_social) > 100:
-                recorte = titulo_social[:100]
-
-                if " " in recorte:
-                    recorte = recorte.rsplit(
-                        " ",
-                        1
-                    )[0]
-
-                titulo_social = recorte.rstrip(
-                    " ,;:-"
-                )
-
-            # Garantiza que el primer texto visible de WordPress sea
-            # el título social aunque Gemini no respete el formato.
-            texto_visible = re.sub(
-                r"<[^>]+>",
-                " ",
-                contenido_html
-            )
-            texto_visible = html.unescape(
-                texto_visible
-            )
-            texto_visible = re.sub(
-                r"\s+",
-                " ",
-                texto_visible
-            ).strip()
-
-            if not texto_visible.startswith(
-                titulo_social
-            ):
-                contenido_html = (
-                    f"<p>{html.escape(titulo_social)}</p>"
-                    + contenido_html
-                )
-
             titulo_miniatura = html.unescape(
                 articulo.get(
                     "titulo_miniatura",
@@ -905,7 +867,6 @@ REGLAS EDITORIALES PARA ELEGIR LA IMAGEN:
 
             return {
                 "titulo": titulo,
-                "titulo_social": titulo_social,
                 "contenido_html": contenido_html,
                 "titulo_miniatura": limitar_texto(
                     titulo_miniatura,
@@ -3352,9 +3313,9 @@ if __name__ == "__main__":
 
     if EJECUCION_MANUAL_GITHUB:
         print(
-            "🧪 Ejecución de PRUEBA detectada "
+            "🧪 Ejecución de prueba detectada "
             "(Run workflow o Re-run jobs): "
-            "se permite publicar para probar las redes sociales."
+            "se permite publicar sin esperar 37,2 h."
         )
         print(
             "ℹ️ Las ejecuciones automáticas siguen respetando "
@@ -3391,10 +3352,30 @@ if __name__ == "__main__":
         "contenido_html"
     ]
 
-    titulo_social = articulo.get(
-        "titulo_social",
-        titulo
+    titulo_social = construir_titulo_social(
+        titulo,
+        tema
     )
+
+    texto_visible = re.sub(
+        r"<[^>]+>",
+        " ",
+        contenido_html
+    )
+    texto_visible = html.unescape(
+        texto_visible
+    )
+    texto_visible = re.sub(
+        r"\s+",
+        " ",
+        texto_visible
+    ).strip()
+
+    if not texto_visible.startswith(titulo_social):
+        contenido_html = (
+            f"<p>{html.escape(titulo_social)}</p>"
+            + contenido_html
+        )
 
     titulo_miniatura = articulo[
         "titulo_miniatura"
@@ -3424,7 +3405,7 @@ if __name__ == "__main__":
         f"📰 Título artículo: {titulo}"
     )
     print(
-        "🔎 Título social / primer texto de WordPress "
+        "🔎 Primeros caracteres para redes "
         f"({len(titulo_social)}/100): {titulo_social}"
     )
     print(
