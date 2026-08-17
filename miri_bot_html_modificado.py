@@ -5,12 +5,8 @@ import html
 import re
 import mimetypes
 import unicodedata
-import calendar
-from datetime import datetime, timezone, timedelta
-from difflib import SequenceMatcher
-from email.utils import parsedate_to_datetime
-from urllib.parse import quote_plus
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from io import BytesIO
 
 from PIL import Image, ImageDraw, ImageFont, ImageStat
@@ -19,10 +15,8 @@ from PIL import Image, ImageDraw, ImageFont, ImageStat
 # MIRI TE LO CUENTA · BOT AUTOMÁTICO
 # ============================================================
 # FLUJO:
-# Google Trends + Google News + Google Search social + RSS
-# -> selección editorial anti-repetición -> verificación web estricta
-# -> Gemini -> miniatura 1200x630 -> MP4 fijo 5 s
-# -> WordPress -> pack Metricool -> historial estructurado
+# RSS -> Gemini -> selección visual editorial -> miniatura 1200x630
+# -> WordPress -> historial
 #
 # MOTOR VISUAL:
 # 1) Identifica el tipo visual:
@@ -43,10 +37,6 @@ from PIL import Image, ImageDraw, ImageFont, ImageStat
 # Requisitos Python:
 #   requests
 #   pillow
-#
-# Para generar MP4:
-#   ffmpeg disponible en el sistema (recomendado).
-# Si no existe, el bot no falla: genera igualmente ambas imágenes sociales.
 # ============================================================
 
 
@@ -60,95 +50,19 @@ WP_APP_PASS = (os.environ.get("WP_APP_PASS") or "").strip().replace(" ", "")
 
 HISTORIAL_FILE = "historial_temas.json"
 
-# ============================================================
-# TENDENCIAS + FRECUENCIA
-# ============================================================
-# El bot ya no se queda con el primer titular de un RSS.
-# Construye una bolsa amplia de candidatos, los cruza y luego
-# Gemini elige la tendencia más útil para "Miri te lo cuenta".
-#
-# Fuentes:
-# - Google Trends España (RSS oficial exportable)
-# - varias búsquedas de Google News
-# - 20minutos
-# - Google Search en tiempo real mediante la MISMA GEMINI_API_KEY
-#
-# No hace falta ninguna clave nueva.
-GOOGLE_TRENDS_RSS = "https://trends.google.com/trending/rss?geo=ES"
+# ÚNICO cambio funcional respecto al bot antiguo que sí publicaba.
+# 31 días / 20 publicaciones = 37,2 horas.
+INTERVALO_PUBLICACION_HORAS = float(
+    os.environ.get(
+        "INTERVALO_PUBLICACION_HORAS",
+        "37.2"
+    )
+)
 
-GOOGLE_NEWS_QUERIES = [
-    'TikTok España viral when:1d',
-    'influencer España polémica viral when:1d',
-    'youtuber España polémica viral when:1d',
-    'streamer España Twitch Kick polémica when:1d',
-    'YouTube España viral creador when:1d',
-    'Instagram España influencer viral when:1d',
-    'reality televisión España redes sociales when:1d',
-    'Telecinco Antena 3 reality redes sociales when:1d',
-    'meme tendencia Internet España when:1d',
-    'famoso ruptura polémica redes sociales España when:1d',
-    'música viral TikTok España when:1d',
-    'creador de contenido España tendencia when:1d',
-    'viral redes sociales España when:1d',
-]
-
-FEEDS_GENERALES = [
+FEEDS_TENDENCIAS = [
+    "https://news.google.com/rss/search?q=viral+OR+tiktok+OR+telecinco+OR+reality&hl=es&gl=ES&ceid=ES:es",
     "https://20minutos.es/rss/"
 ]
-
-# Máximo de candidatos que pasan a la selección final.
-MAX_CANDIDATOS_TENDENCIA = int(
-    os.environ.get("MAX_CANDIDATOS_TENDENCIA", "70")
-)
-
-# Ritmo adaptado al plan gratuito de Metricool.
-#
-# En este proyecto cada artículo consume SOLO 1 publicación
-# de Metricool: la publicación con imagen fija en Instagram.
-#
-# Facebook NO cuenta aquí porque el contenido de Instagram se
-# comparte automáticamente en Facebook desde Meta.
-#
-# El vídeo vertical de 5 segundos se genera igualmente, pero
-# queda como archivo para publicación manual y NO interviene
-# en el cálculo de frecuencia.
-#
-# Con 20 publicaciones disponibles:
-# - mes de 31 días -> 37,2 h entre artículos
-# - mes de 30 días -> 36,0 h
-# - mes de 28 días -> 33,6 h
-ARTICULOS_MES_OBJETIVO = int(
-    os.environ.get("ARTICULOS_MES_OBJETIVO", "20")
-)
-METRICOOL_PUBLICACIONES_MES = int(
-    os.environ.get("METRICOOL_PUBLICACIONES_MES", "20")
-)
-
-COOLDOWN_ENTIDAD_DIAS = int(
-    os.environ.get("COOLDOWN_ENTIDAD_DIAS", "7")
-)
-HISTORIAL_REPETICION_DIAS = int(
-    os.environ.get("HISTORIAL_REPETICION_DIAS", "30")
-)
-UMBRAL_SIMILITUD_TEMA = float(
-    os.environ.get("UMBRAL_SIMILITUD_TEMA", "0.72")
-)
-
-# Seguridad editorial:
-# una tendencia descubierta mediante búsqueda social no se publica
-# si Google Search no aporta al menos 2 evidencias web reales.
-MIN_GROUNDING_TENDENCIA = int(
-    os.environ.get("MIN_GROUNDING_TENDENCIA", "2")
-)
-MIN_GROUNDING_INVESTIGACION = int(
-    os.environ.get("MIN_GROUNDING_INVESTIGACION", "2")
-)
-MIN_CONFIANZA_INVESTIGACION = int(
-    os.environ.get("MIN_CONFIANZA_INVESTIGACION", "70")
-)
-MAX_INTENTOS_VERIFICACION = int(
-    os.environ.get("MAX_INTENTOS_VERIFICACION", "6")
-)
 
 HEADERS_BROWSER = {
     "User-Agent": (
@@ -193,8 +107,6 @@ UMBRAL_SCORE = {
 }
 
 OUTPUT_IMAGE = "miniatura_destacada.jpg"
-
-# Pack social generado automáticamente por cada artículo.
 
 # Branding Miri te lo cuenta
 COLOR_BG = "#E9E1DA"
@@ -383,192 +295,182 @@ def normalizar_tipo_visual(tipo_visual):
 
 
 # ==========================================
-# 4. HISTORIAL, FRECUENCIA Y TENDENCIAS
+# 3B. FRECUENCIA REAL DESDE WORDPRESS
 # ==========================================
-def _parse_iso_fecha(valor):
+def _parse_wp_date_gmt(valor):
+    valor = str(
+        valor
+        or ""
+    ).strip()
+
     if not valor:
         return None
 
-    if isinstance(valor, datetime):
-        dt = valor
-    else:
-        texto = str(valor).strip()
-
-        try:
-            dt = datetime.fromisoformat(
-                texto.replace("Z", "+00:00")
+    try:
+        # WordPress devuelve normalmente YYYY-MM-DDTHH:MM:SS
+        dt = datetime.fromisoformat(
+            valor.replace(
+                "Z",
+                "+00:00"
             )
-        except Exception:
-            try:
-                dt = parsedate_to_datetime(texto)
-            except Exception:
-                return None
-
-    if dt.tzinfo is None:
-        dt = dt.replace(
-            tzinfo=timezone.utc
         )
 
-    return dt.astimezone(
+        if dt.tzinfo is None:
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
+
+        return dt.astimezone(
+            timezone.utc
+        )
+
+    except Exception:
+        return None
+
+
+def obtener_ultima_publicacion_wordpress():
+    """
+    Consulta la última entrada REAL publicada en WordPress.
+
+    Esto evita depender de historial_temas.json, que en GitHub Actions
+    puede no persistir entre ejecuciones.
+    """
+    if not WP_URL:
+        return None
+
+    url = (
+        f"{WP_URL}/wp-json/wp/v2/posts"
+    )
+
+    params = {
+        "per_page": 1,
+        "orderby": "date",
+        "order": "desc",
+        "status": "publish",
+        "_fields": "id,date_gmt,link",
+    }
+
+    try:
+        respuesta = requests.get(
+            url,
+            params=params,
+            auth=(
+                WP_USER,
+                WP_APP_PASS
+            ) if (
+                WP_USER
+                and WP_APP_PASS
+            ) else None,
+            timeout=25
+        )
+
+        if respuesta.status_code != 200:
+            print(
+                "⚠️ No pude comprobar la última publicación "
+                f"en WordPress ({respuesta.status_code}). "
+                "No bloquearé el bot por un fallo de consulta."
+            )
+            return None
+
+        datos = respuesta.json()
+
+        if not isinstance(
+            datos,
+            list
+        ) or not datos:
+            return None
+
+        ultima = datos[0]
+
+        fecha = _parse_wp_date_gmt(
+            ultima.get(
+                "date_gmt"
+            )
+        )
+
+        if fecha:
+            print(
+                "🕒 Última publicación real en WordPress: "
+                f"{fecha.isoformat()}"
+            )
+
+        return fecha
+
+    except Exception as exc:
+        print(
+            "⚠️ No pude consultar WordPress para la frecuencia: "
+            f"{exc}. No bloquearé el bot por ese fallo."
+        )
+        return None
+
+
+def puede_publicar_por_frecuencia():
+    ultima = obtener_ultima_publicacion_wordpress()
+
+    if not ultima:
+        print(
+            "✅ Sin bloqueo de frecuencia: no se encontró "
+            "una publicación anterior verificable."
+        )
+        return True
+
+    ahora = datetime.now(
         timezone.utc
     )
 
+    transcurridas = (
+        ahora
+        - ultima
+    ).total_seconds() / 3600.0
 
-def cargar_historial():
-    """
-    Compatible con el historial antiguo, que era una lista de strings,
-    y con el nuevo historial estructurado.
-    """
-    if not os.path.exists(
-        HISTORIAL_FILE
-    ):
-        return []
-
-    try:
-        with open(
-            HISTORIAL_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-            data = json.load(f)
-
-        if not isinstance(
-            data,
-            list
-        ):
-            return []
-
-        normalizado = []
-
-        for item in data:
-            if isinstance(
-                item,
-                str
-            ):
-                normalizado.append({
-                    "tema": item,
-                    "titulo": item,
-                    "entidad": "",
-                    "categoria": "",
-                    "keywords": [],
-                    "fecha": None,
-                })
-
-            elif isinstance(
-                item,
-                dict
-            ):
-                item = dict(item)
-
-                item.setdefault(
-                    "tema",
-                    item.get(
-                        "titulo",
-                        ""
-                    )
-                )
-
-                item.setdefault(
-                    "titulo",
-                    item.get(
-                        "tema",
-                        ""
-                    )
-                )
-
-                item.setdefault(
-                    "entidad",
-                    ""
-                )
-
-                item.setdefault(
-                    "categoria",
-                    ""
-                )
-
-                item.setdefault(
-                    "keywords",
-                    []
-                )
-
-                item.setdefault(
-                    "fecha",
-                    None
-                )
-
-                normalizado.append(
-                    item
-                )
-
-        return normalizado
-
-    except Exception as e:
-        print(
-            f"⚠️ No se pudo leer el historial: {e}"
+    if transcurridas < INTERVALO_PUBLICACION_HORAS:
+        faltan = (
+            INTERVALO_PUBLICACION_HORAS
+            - transcurridas
         )
-        return []
 
+        print(
+            "⏸️ No toca publicar todavía. "
+            f"Han pasado {transcurridas:.1f} h; "
+            f"el intervalo es {INTERVALO_PUBLICACION_HORAS:.1f} h. "
+            f"Faltan ~{faltan:.1f} h."
+        )
 
-def guardar_en_historial(
-    tema,
-    titulo="",
-    entidad="",
-    categoria="",
-    keywords=None,
-    fuente="",
-    url="",
-    score_tendencia=None
-):
-    historial = cargar_historial()
+        return False
 
-    registro = {
-        "tema": (
-            tema
-            or titulo
-            or ""
-        ).strip(),
-        "titulo": (
-            titulo
-            or tema
-            or ""
-        ).strip(),
-        "entidad": (
-            entidad
-            or ""
-        ).strip(),
-        "categoria": (
-            categoria
-            or ""
-        ).strip(),
-        "keywords": deduplicar_lista(
-            asegurar_lista(
-                keywords
-            )
-        )[:12],
-        "fuente": (
-            fuente
-            or ""
-        ).strip(),
-        "url": (
-            url
-            or ""
-        ).strip(),
-        "score_tendencia": score_tendencia,
-        "fecha": datetime.now(
-            timezone.utc
-        ).isoformat(
-            timespec="seconds"
-        ),
-    }
-
-    historial.append(
-        registro
+    print(
+        "✅ Frecuencia permitida: "
+        f"han pasado {transcurridas:.1f} h "
+        f"(mínimo {INTERVALO_PUBLICACION_HORAS:.1f} h)."
     )
 
-    # Mantiene el fichero razonablemente pequeño.
-    historial = historial[
-        -250:
-    ]
+    return True
+
+
+# ==========================================
+# 4. HISTORIAL Y TENDENCIAS
+# ==========================================
+def cargar_historial():
+    if os.path.exists(HISTORIAL_FILE):
+        try:
+            with open(
+                HISTORIAL_FILE,
+                "r",
+                encoding="utf-8"
+            ) as f:
+                data = json.load(f)
+                return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    return []
+
+
+def guardar_en_historial(tema):
+    historial = cargar_historial()
+
+    if tema not in historial:
+        historial.append(tema)
 
     with open(
         HISTORIAL_FILE,
@@ -583,135 +485,10 @@ def guardar_en_historial(
         )
 
 
-def articulos_mes_efectivos():
-    """
-    Cada artículo consume una sola publicación de Metricool:
-    Instagram con imagen fija.
-
-    Facebook se comparte desde Instagram y el vídeo vertical
-    se publica manualmente, por lo que ninguno de los dos
-    consume publicaciones adicionales en este cálculo.
-    """
-    return max(
-        1,
-        min(
-            ARTICULOS_MES_OBJETIVO,
-            METRICOOL_PUBLICACIONES_MES
-        )
-    )
-
-
-def intervalo_objetivo_horas(
-    momento=None
-):
-    momento = (
-        momento
-        or datetime.now(
-            timezone.utc
-        )
-    )
-
-    dias = calendar.monthrange(
-        momento.year,
-        momento.month
-    )[1]
-
-    return (
-        dias
-        * 24.0
-        / articulos_mes_efectivos()
-    )
-
-
-def publicaciones_este_mes():
-    ahora = datetime.now(
-        timezone.utc
-    )
-
-    total = 0
-
-    for item in cargar_historial():
-        fecha = _parse_iso_fecha(
-            item.get(
-                "fecha"
-            )
-        )
-
-        if (
-            fecha
-            and fecha.year == ahora.year
-            and fecha.month == ahora.month
-        ):
-            total += 1
-
-    return total
-
-
-def ultima_publicacion():
-    fechas = []
-
-    for item in cargar_historial():
-        fecha = _parse_iso_fecha(
-            item.get(
-                "fecha"
-            )
-        )
-
-        if fecha:
-            fechas.append(
-                fecha
-            )
-
-    return max(
-        fechas
-    ) if fechas else None
-
-
-def puede_publicar_ahora():
-    objetivo = articulos_mes_efectivos()
-    hechas = publicaciones_este_mes()
-
-    if hechas >= objetivo:
-        print(
-            "⏸️ Cuota mensual alcanzada: "
-            f"{hechas}/{objetivo} artículos."
-        )
-        return False
-
-    ultima = ultima_publicacion()
-
-    if not ultima:
-        return True
-
-    intervalo = intervalo_objetivo_horas()
-    transcurridas = (
-        datetime.now(
-            timezone.utc
-        )
-        - ultima
-    ).total_seconds() / 3600.0
-
-    if transcurridas < intervalo:
-        faltan = intervalo - transcurridas
-
-        print(
-            "⏸️ Todavía no toca publicar. "
-            f"Objetivo actual: {objetivo} artículos/mes. "
-            f"Intervalo aproximado: {intervalo:.1f} h. "
-            f"Faltan ~{faltan:.1f} h."
-        )
-
-        return False
-
-    return True
-
-
 def limpiar_titulo_feed(title):
-    title = html.unescape(
-        (title or "").strip()
-    )
+    title = (title or "").strip()
 
-    # Elimina sufijos típicos tipo " - Medio X".
+    # Elimina sufijos típicos tipo " - Medio X"
     title = re.sub(
         r"\s+-\s+[^-]{2,60}$",
         "",
@@ -721,655 +498,10 @@ def limpiar_titulo_feed(title):
     return title
 
 
-def _texto_local_tag(
-    elem,
-    nombre
-):
-    for child in elem.iter():
-        tag = str(
-            child.tag
-        )
+def obtener_nuevo_tema_viral():
+    historial = cargar_historial()
 
-        if tag.split(
-            "}"
-        )[-1] == nombre:
-            return (
-                child.text
-                or ""
-            ).strip()
-
-    return ""
-
-
-def _fecha_item_rss(item):
-    for nombre in [
-        "pubDate",
-        "published",
-        "updated"
-    ]:
-        texto = _texto_local_tag(
-            item,
-            nombre
-        )
-
-        if texto:
-            fecha = _parse_iso_fecha(
-                texto
-            )
-
-            if fecha:
-                return fecha.isoformat()
-
-    return ""
-
-
-def crear_candidato(
-    titulo,
-    fuente,
-    url="",
-    contexto="",
-    senal="",
-    fecha="",
-    trafico="",
-    score_base=0
-):
-    titulo = limpiar_titulo_feed(
-        titulo
-    )
-
-    if not titulo:
-        return None
-
-    return {
-        "titulo": titulo,
-        "fuente": (
-            fuente
-            or ""
-        ).strip(),
-        "url": (
-            url
-            or ""
-        ).strip(),
-        "contexto": (
-            contexto
-            or ""
-        ).strip(),
-        "senales": [
-            senal
-        ] if senal else [],
-        "fuentes": [
-            fuente
-        ] if fuente else [],
-        "fecha": fecha,
-        "trafico": (
-            trafico
-            or ""
-        ).strip(),
-        "score_base": int(
-            score_base
-            or 0
-        ),
-    }
-
-
-def similaridad_texto(
-    a,
-    b
-):
-    a_norm = normalizar_texto(
-        a
-    )
-
-    b_norm = normalizar_texto(
-        b
-    )
-
-    if not a_norm or not b_norm:
-        return 0.0
-
-    seq = SequenceMatcher(
-        None,
-        a_norm,
-        b_norm
-    ).ratio()
-
-    a_tokens = set(
-        tokenizar(
-            a_norm
-        )
-    )
-
-    b_tokens = set(
-        tokenizar(
-            b_norm
-        )
-    )
-
-    if (
-        a_tokens
-        and b_tokens
-    ):
-        jac = len(
-            a_tokens
-            & b_tokens
-        ) / max(
-            1,
-            len(
-                a_tokens
-                | b_tokens
-            )
-        )
-    else:
-        jac = 0.0
-
-    return max(
-        seq,
-        jac
-    )
-
-
-def fusionar_candidatos(
-    candidatos
-):
-    """
-    Si una misma historia aparece en varias fuentes, la fusiona.
-    Esa coincidencia cuenta como señal de tendencia real.
-    """
-    fusionados = []
-
-    for candidato in candidatos:
-        if not candidato:
-            continue
-
-        mejor = None
-        mejor_sim = 0.0
-
-        for existente in fusionados:
-            sim = similaridad_texto(
-                candidato.get(
-                    "titulo",
-                    ""
-                ),
-                existente.get(
-                    "titulo",
-                    ""
-                )
-            )
-
-            if sim > mejor_sim:
-                mejor_sim = sim
-                mejor = existente
-
-        if (
-            mejor is not None
-            and mejor_sim >= 0.82
-        ):
-            mejor[
-                "score_base"
-            ] = max(
-                mejor.get(
-                    "score_base",
-                    0
-                ),
-                candidato.get(
-                    "score_base",
-                    0
-                )
-            ) + 8
-
-            mejor[
-                "fuentes"
-            ] = deduplicar_lista(
-                (
-                    mejor.get(
-                        "fuentes",
-                        []
-                    )
-                    + candidato.get(
-                        "fuentes",
-                        []
-                    )
-                )
-            )
-
-            mejor[
-                "senales"
-            ] = deduplicar_lista(
-                (
-                    mejor.get(
-                        "senales",
-                        []
-                    )
-                    + candidato.get(
-                        "senales",
-                        []
-                    )
-                )
-            )
-
-            if (
-                len(
-                    candidato.get(
-                        "contexto",
-                        ""
-                    )
-                )
-                > len(
-                    mejor.get(
-                        "contexto",
-                        ""
-                    )
-                )
-            ):
-                mejor[
-                    "contexto"
-                ] = candidato.get(
-                    "contexto",
-                    ""
-                )
-
-            if (
-                not mejor.get(
-                    "url"
-                )
-                and candidato.get(
-                    "url"
-                )
-            ):
-                mejor[
-                    "url"
-                ] = candidato.get(
-                    "url"
-                )
-
-        else:
-            fusionados.append(
-                dict(
-                    candidato
-                )
-            )
-
-    return fusionados
-
-
-PALABRAS_MIRI = {
-    "tiktok", "instagram", "youtube", "youtuber",
-    "streamer", "twitch", "kick", "influencer",
-    "creador", "creadora", "viral", "meme",
-    "reality", "telecinco", "antena", "mediaset",
-    "famoso", "famosa", "celebridad", "polemica",
-    "polémica", "redes", "internet", "directo",
-    "streaming", "video", "vídeo", "programa",
-    "cantante", "artista", "musica", "música",
-    "ruptura", "pareja", "concurso", "gran hermano",
-    "supervivientes", "tentaciones", "fandom",
-}
-
-PALABRAS_DESCARTE = {
-    "bolsa", "ibex", "euribor", "meteorologia",
-    "meteorología", "terremoto", "accidente",
-    "asesinato", "guerra", "elecciones", "elección",
-    "partido político", "congreso", "senado",
-}
-
-
-def score_encaje_miri(
-    candidato
-):
-    texto = normalizar_texto(
-        " ".join([
-            candidato.get(
-                "titulo",
-                ""
-            ),
-            candidato.get(
-                "contexto",
-                ""
-            ),
-        ])
-    )
-
-    score = int(
-        candidato.get(
-            "score_base",
-            0
-        )
-    )
-
-    for palabra in PALABRAS_MIRI:
-        if normalizar_texto(
-            palabra
-        ) in texto:
-            score += 6
-
-    for palabra in PALABRAS_DESCARTE:
-        if normalizar_texto(
-            palabra
-        ) in texto:
-            score -= 20
-
-    # Deporte puro no es el foco salvo que exista ángulo
-    # claro de cultura de Internet/celebridad.
-    deporte = {
-        "futbol", "fútbol", "liga", "champions",
-        "tenis", "formula 1", "f1", "baloncesto",
-        "athletic", "betis", "madrid", "barça",
-    }
-
-    tiene_deporte = any(
-        normalizar_texto(
-            x
-        ) in texto
-        for x in deporte
-    )
-
-    tiene_angulo_miri = any(
-        normalizar_texto(
-            x
-        ) in texto
-        for x in {
-            "viral",
-            "tiktok",
-            "influencer",
-            "streamer",
-            "redes",
-            "meme",
-            "famoso",
-        }
-    )
-
-    if (
-        tiene_deporte
-        and not tiene_angulo_miri
-    ):
-        score -= 28
-
-    return score
-
-
-def penalizacion_historial(
-    titulo,
-    entidad=""
-):
-    ahora = datetime.now(
-        timezone.utc
-    )
-
-    penalizacion = 0
-    repeticion_dura = False
-
-    entidad_norm = normalizar_texto(
-        entidad
-    )
-
-    for item in cargar_historial():
-        fecha = _parse_iso_fecha(
-            item.get(
-                "fecha"
-            )
-        )
-
-        if fecha:
-            edad_dias = (
-                ahora - fecha
-            ).total_seconds() / 86400.0
-
-            if edad_dias > HISTORIAL_REPETICION_DIAS:
-                continue
-        else:
-            # Historial antiguo: se compara por título, pero no
-            # activa cooldown de entidad porque no sabemos la fecha.
-            edad_dias = None
-
-        previo = (
-            item.get(
-                "tema"
-            )
-            or item.get(
-                "titulo"
-            )
-            or ""
-        )
-
-        sim = similaridad_texto(
-            titulo,
-            previo
-        )
-
-        if sim >= UMBRAL_SIMILITUD_TEMA:
-            penalizacion += 100
-            repeticion_dura = True
-
-        elif sim >= 0.58:
-            penalizacion += 35
-
-        entidad_previa = normalizar_texto(
-            item.get(
-                "entidad",
-                ""
-            )
-        )
-
-        if (
-            entidad_norm
-            and entidad_previa
-            and entidad_norm == entidad_previa
-            and edad_dias is not None
-            and edad_dias < COOLDOWN_ENTIDAD_DIAS
-        ):
-            penalizacion += 28
-
-    return penalizacion, repeticion_dura
-
-
-def recoger_google_trends():
-    candidatos = []
-
-    try:
-        res = requests.get(
-            GOOGLE_TRENDS_RSS,
-            headers=HEADERS_BROWSER,
-            timeout=20
-        )
-
-        if res.status_code != 200:
-            print(
-                "⚠️ Google Trends RSS no respondió correctamente."
-            )
-            return candidatos
-
-        root = ET.fromstring(
-            res.content
-        )
-
-        for item in root.findall(
-            ".//item"
-        )[:30]:
-            titulo = _texto_local_tag(
-                item,
-                "title"
-            )
-
-            trafico = _texto_local_tag(
-                item,
-                "approx_traffic"
-            )
-
-            picture_source = _texto_local_tag(
-                item,
-                "picture_source"
-            )
-
-            news_titles = []
-
-            for child in item.iter():
-                local = str(
-                    child.tag
-                ).split(
-                    "}"
-                )[-1]
-
-                if (
-                    local == "news_item_title"
-                    and child.text
-                ):
-                    news_titles.append(
-                        child.text.strip()
-                    )
-
-            contexto = " | ".join(
-                deduplicar_lista(
-                    news_titles
-                )[:3]
-            )
-
-            if picture_source:
-                contexto = (
-                    contexto
-                    + " | "
-                    + picture_source
-                ).strip(
-                    " |"
-                )
-
-            score = 34
-
-            trafico_num = re.sub(
-                r"\D",
-                "",
-                trafico
-                or ""
-            )
-
-            if trafico_num:
-                try:
-                    n = int(
-                        trafico_num
-                    )
-
-                    if n >= 100000:
-                        score += 20
-                    elif n >= 50000:
-                        score += 15
-                    elif n >= 10000:
-                        score += 10
-                    elif n >= 5000:
-                        score += 6
-                except Exception:
-                    pass
-
-            candidatos.append(
-                crear_candidato(
-                    titulo=titulo,
-                    fuente="Google Trends",
-                    url=GOOGLE_TRENDS_RSS,
-                    contexto=contexto,
-                    senal="google_trends",
-                    fecha=_fecha_item_rss(
-                        item
-                    ),
-                    trafico=trafico,
-                    score_base=score
-                )
-            )
-
-    except Exception as e:
-        print(
-            f"⚠️ Error leyendo Google Trends: {e}"
-        )
-
-    return [
-        x
-        for x in candidatos
-        if x
-    ]
-
-
-def construir_google_news_feed(
-    query
-):
-    return (
-        "https://news.google.com/rss/search?q="
-        + quote_plus(
-            query
-        )
-        + "&hl=es&gl=ES&ceid=ES:es"
-    )
-
-
-def recoger_google_news():
-    candidatos = []
-
-    for query in GOOGLE_NEWS_QUERIES:
-        url = construir_google_news_feed(
-            query
-        )
-
-        try:
-            res = requests.get(
-                url,
-                headers=HEADERS_BROWSER,
-                timeout=15
-            )
-
-            if res.status_code != 200:
-                continue
-
-            root = ET.fromstring(
-                res.content
-            )
-
-            for item in root.findall(
-                ".//item"
-            )[:8]:
-                titulo = _texto_local_tag(
-                    item,
-                    "title"
-                )
-
-                link = _texto_local_tag(
-                    item,
-                    "link"
-                )
-
-                fuente = _texto_local_tag(
-                    item,
-                    "source"
-                ) or "Google News"
-
-                candidato = crear_candidato(
-                    titulo=titulo,
-                    fuente=fuente,
-                    url=link,
-                    contexto=(
-                        "Detectado con Google News. "
-                        f"Búsqueda temática: {query}"
-                    ),
-                    senal="google_news",
-                    fecha=_fecha_item_rss(
-                        item
-                    ),
-                    score_base=18
-                )
-
-                if candidato:
-                    candidatos.append(
-                        candidato
-                    )
-
-        except Exception as e:
-            print(
-                "⚠️ Error en Google News "
-                f"({query}): {e}"
-            )
-
-    return candidatos
-
-
-def recoger_feeds_generales():
-    candidatos = []
-
-    for feed_url in FEEDS_GENERALES:
+    for feed_url in FEEDS_TENDENCIAS:
         try:
             res = requests.get(
                 feed_url,
@@ -1380,1627 +512,27 @@ def recoger_feeds_generales():
             if res.status_code != 200:
                 continue
 
-            root = ET.fromstring(
-                res.content
-            )
+            root = ET.fromstring(res.content)
 
-            for item in root.findall(
-                ".//item"
-            )[:25]:
-                titulo = _texto_local_tag(
-                    item,
-                    "title"
+            for item in root.findall(".//item"):
+                title_elem = item.find("title")
+
+                if title_elem is None or not title_elem.text:
+                    continue
+
+                title = limpiar_titulo_feed(
+                    title_elem.text
                 )
 
-                link = _texto_local_tag(
-                    item,
-                    "link"
-                )
-
-                descripcion = limpiar_html_tags(
-                    _texto_local_tag(
-                        item,
-                        "description"
-                    )
-                )
-
-                candidato = crear_candidato(
-                    titulo=titulo,
-                    fuente="20minutos",
-                    url=link,
-                    contexto=limitar_texto(
-                        descripcion,
-                        300
-                    ),
-                    senal="medio_general",
-                    fecha=_fecha_item_rss(
-                        item
-                    ),
-                    score_base=10
-                )
-
-                if candidato:
-                    candidatos.append(
-                        candidato
-                    )
+                if title and title not in historial:
+                    return title
 
         except Exception as e:
             print(
                 f"⚠️ Error leyendo feed {feed_url}: {e}"
             )
 
-    return candidatos
-
-
-def _modelos_para_google_search():
-    disponibles = obtener_modelos_disponibles()
-
-    preferidos = []
-
-    # Google Search está pensado para modelos Gemini recientes.
-    for patron in [
-        "gemini-3",
-        "gemini-2.5-flash",
-        "gemini-2.5-pro",
-        "gemini-2.0-flash",
-    ]:
-        for modelo in disponibles:
-            m = modelo.lower()
-
-            if (
-                patron in m
-                and "image" not in m
-                and "tts" not in m
-                and "embedding" not in m
-                and modelo not in preferidos
-            ):
-                preferidos.append(
-                    modelo
-                )
-
-    return (
-        preferidos[:6]
-        or [
-            "gemini-2.5-flash"
-        ]
-    )
-
-
-def _extraer_grounding_sources(candidate):
-    """
-    Extrae las fuentes que Google Search realmente devolvió
-    en groundingMetadata. No depende de URLs escritas por Gemini.
-    """
-    salida = []
-
-    metadata = (
-        candidate.get(
-            "groundingMetadata",
-            {}
-        )
-        or {}
-    )
-
-    chunks = (
-        metadata.get(
-            "groundingChunks",
-            []
-        )
-        or []
-    )
-
-    for chunk in chunks:
-        web = (
-            chunk.get(
-                "web",
-                {}
-            )
-            or {}
-        )
-
-        uri = str(
-            web.get(
-                "uri",
-                ""
-            )
-            or ""
-        ).strip()
-
-        title = str(
-            web.get(
-                "title",
-                ""
-            )
-            or ""
-        ).strip()
-
-        if not uri:
-            continue
-
-        salida.append({
-            "titulo": title,
-            "url": uri,
-        })
-
-    # Deduplicación por URL.
-    vistos = set()
-    unicos = []
-
-    for item in salida:
-        clave = item.get(
-            "url",
-            ""
-        )
-
-        if (
-            clave
-            and clave not in vistos
-        ):
-            vistos.add(
-                clave
-            )
-            unicos.append(
-                item
-            )
-
-    return unicos
-
-
-def _gemini_google_search_json(
-    prompt,
-    timeout=70
-):
-    """
-    Usa la misma GEMINI_API_KEY con Google Search.
-
-    Además del JSON pedido al modelo, devuelve en
-    `_grounding_sources` las fuentes REALES que aparecen
-    en groundingMetadata. Esas fuentes son la prueba
-    editorial; una URL inventada dentro del texto no cuenta.
-    """
-    if not GEMINI_API_KEY:
-        return None
-
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY,
-    }
-
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": prompt
-                    }
-                ]
-            }
-        ],
-        "tools": [
-            {
-                "google_search": {}
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.15
-        }
-    }
-
-    for modelo in _modelos_para_google_search():
-        url = (
-            "https://generativelanguage.googleapis.com/"
-            "v1beta/models/"
-            f"{modelo}:generateContent"
-        )
-
-        try:
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=timeout
-            )
-
-            if response.status_code != 200:
-                continue
-
-            data = response.json()
-
-            candidates = data.get(
-                "candidates",
-                []
-            )
-
-            if not candidates:
-                continue
-
-            candidate = candidates[0]
-
-            partes = (
-                candidate
-                .get(
-                    "content",
-                    {}
-                )
-                .get(
-                    "parts",
-                    []
-                )
-            )
-
-            texto = "\n".join(
-                str(
-                    p.get(
-                        "text",
-                        ""
-                    )
-                )
-                for p in partes
-                if p.get(
-                    "text"
-                )
-            ).strip()
-
-            if not texto:
-                continue
-
-            parsed = extraer_json_de_respuesta(
-                texto
-            )
-
-            if not isinstance(
-                parsed,
-                dict
-            ):
-                continue
-
-            parsed[
-                "_grounding_sources"
-            ] = _extraer_grounding_sources(
-                candidate
-            )
-
-            return parsed
-
-        except Exception as e:
-            print(
-                f"⚠️ Google Search con {modelo}: {e}"
-            )
-
     return None
-
-
-def recoger_tendencias_sociales_gemini():
-    """
-    Amplía la detección a conversación social, pero Gemini
-    SOLO sirve para DESCUBRIR.
-
-    Una supuesta tendencia no entra en la bolsa si la búsqueda
-    de Google no devuelve evidencias web reales suficientes.
-    """
-    prompts = [
-        """
-Busca en Google temas de las últimas 24-48 horas que estén
-generando conversación digital REAL en España alrededor de
-TikTok, Instagram, YouTube, Twitch, Kick, streamers,
-influencers y creadores de contenido.
-
-NO conviertas consejos antiguos, artículos evergreen ni una
-sola publicación aislada en "tendencia".
-
-Devuelve SOLO JSON:
-{
-  "tendencias": [
-    {
-      "titulo": "hecho o conversación concreta",
-      "contexto": "qué ha ocurrido y por qué se habla de ello",
-      "entidad": "persona/programa/tema principal",
-      "categoria": "INFLUENCERS|STREAMERS|TIKTOK|YOUTUBE|VIRAL|OTRO"
-    }
-  ]
-}
-Máximo 8 tendencias.
-""",
-        """
-Busca en Google noticias y conversaciones de las últimas
-48 horas en España sobre realities, televisión que esté
-moviendo redes, famosos, polémicas de influencers, rupturas
-públicas, memes o fenómenos virales.
-
-No inventes modas. No llames "viral" a algo si no encuentras
-evidencia reciente. Descarta artículos antiguos reciclados.
-
-Devuelve SOLO JSON:
-{
-  "tendencias": [
-    {
-      "titulo": "historia concreta",
-      "contexto": "qué está pasando ahora",
-      "entidad": "entidad principal",
-      "categoria": "REALITY|FAMOSOS|POLEMICA|VIRAL|TV"
-    }
-  ]
-}
-Máximo 8 tendencias.
-""",
-        """
-Busca en Google tendencias emergentes de las últimas 24-48 h
-en España sobre música viral, audios, memes, vídeos, fandoms,
-creadores y personajes de Internet.
-
-Una tendencia debe tener evidencia reciente suficiente para
-un artículo periodístico. Si solo encuentras una mención
-aislada o contenido antiguo, no la incluyas.
-
-Devuelve SOLO JSON:
-{
-  "tendencias": [
-    {
-      "titulo": "tema concreto",
-      "contexto": "qué está pasando y qué señal reciente existe",
-      "entidad": "entidad principal",
-      "categoria": "MUSICA|MEME|VIRAL|CREADOR|FANDOM"
-    }
-  ]
-}
-Máximo 8 tendencias.
-""",
-    ]
-
-    candidatos = []
-
-    for prompt in prompts:
-        data = _gemini_google_search_json(
-            prompt
-        )
-
-        if not isinstance(
-            data,
-            dict
-        ):
-            continue
-
-        grounding = (
-            data.get(
-                "_grounding_sources",
-                []
-            )
-            or []
-        )
-
-        # Si Google Search no ha devuelto evidencias reales,
-        # no usamos lo que haya "sugerido" el modelo.
-        if len(
-            grounding
-        ) < MIN_GROUNDING_TENDENCIA:
-            print(
-                "⚠️ Búsqueda social descartada: "
-                "pocas fuentes reales de Google."
-            )
-            continue
-
-        tendencias = data.get(
-            "tendencias",
-            []
-        )
-
-        if not isinstance(
-            tendencias,
-            list
-        ):
-            continue
-
-        fuente_nombres = deduplicar_lista([
-            item.get(
-                "titulo",
-                ""
-            )
-            for item in grounding
-            if isinstance(
-                item,
-                dict
-            )
-        ])
-
-        urls_grounding = deduplicar_lista([
-            item.get(
-                "url",
-                ""
-            )
-            for item in grounding
-            if isinstance(
-                item,
-                dict
-            )
-        ])
-
-        for item in tendencias[:8]:
-            if not isinstance(
-                item,
-                dict
-            ):
-                continue
-
-            titulo = (
-                item.get(
-                    "titulo",
-                    ""
-                )
-                or ""
-            ).strip()
-
-            contexto = (
-                item.get(
-                    "contexto",
-                    ""
-                )
-                or ""
-            ).strip()
-
-            entidad = (
-                item.get(
-                    "entidad",
-                    ""
-                )
-                or ""
-            ).strip()
-
-            categoria = (
-                item.get(
-                    "categoria",
-                    ""
-                )
-                or ""
-            ).strip()
-
-            if not titulo:
-                continue
-
-            candidato = crear_candidato(
-                titulo=titulo,
-                fuente=(
-                    ", ".join(
-                        fuente_nombres[:3]
-                    )
-                    or "Gemini + Google Search"
-                ),
-                url=(
-                    urls_grounding[0]
-                    if urls_grounding
-                    else ""
-                ),
-                contexto=" | ".join(
-                    x
-                    for x in [
-                        contexto,
-                        (
-                            f"Entidad: {entidad}"
-                            if entidad
-                            else ""
-                        ),
-                        (
-                            f"Categoría: {categoria}"
-                            if categoria
-                            else ""
-                        ),
-                    ]
-                    if x
-                ),
-                senal="google_search_social",
-                fecha=datetime.now(
-                    timezone.utc
-                ).isoformat(
-                    timespec="seconds"
-                ),
-                score_base=24
-            )
-
-            if candidato:
-                candidato[
-                    "entidad_sugerida"
-                ] = entidad
-
-                candidato[
-                    "categoria_sugerida"
-                ] = categoria
-
-                candidato[
-                    "grounding_sources"
-                ] = grounding[:8]
-
-                candidatos.append(
-                    candidato
-                )
-
-    return candidatos
-
-
-def construir_bolsa_tendencias():
-    candidatos = []
-
-    print(
-        "📈 Buscando Google Trends España..."
-    )
-    candidatos.extend(
-        recoger_google_trends()
-    )
-
-    print(
-        "📰 Buscando múltiples verticales en Google News..."
-    )
-    candidatos.extend(
-        recoger_google_news()
-    )
-
-    print(
-        "🌐 Revisando medios generales..."
-    )
-    candidatos.extend(
-        recoger_feeds_generales()
-    )
-
-    print(
-        "🔎 Buscando conversación social con Gemini + Google Search..."
-    )
-    candidatos.extend(
-        recoger_tendencias_sociales_gemini()
-    )
-
-    fusionados = fusionar_candidatos(
-        candidatos
-    )
-
-    for c in fusionados:
-        c[
-            "score_base"
-        ] = score_encaje_miri(
-            c
-        )
-
-        penalizacion, repeticion = penalizacion_historial(
-            c.get(
-                "titulo",
-                ""
-            ),
-            c.get(
-                "entidad_sugerida",
-                ""
-            )
-        )
-
-        c[
-            "penalizacion_historial"
-        ] = penalizacion
-
-        c[
-            "repeticion_dura"
-        ] = repeticion
-
-        c[
-            "score_preliminar"
-        ] = (
-            c.get(
-                "score_base",
-                0
-            )
-            - penalizacion
-            + (
-                max(
-                    0,
-                    len(
-                        c.get(
-                            "fuentes",
-                            []
-                        )
-                    )
-                    - 1
-                )
-                * 7
-            )
-        )
-
-    # Descarta repetición evidente antes de gastar otra llamada a Gemini.
-    fusionados = [
-        c
-        for c in fusionados
-        if not c.get(
-            "repeticion_dura"
-        )
-        and c.get(
-            "score_preliminar",
-            -999
-        ) > -20
-    ]
-
-    fusionados.sort(
-        key=lambda x: x.get(
-            "score_preliminar",
-            0
-        ),
-        reverse=True
-    )
-
-    return fusionados[
-        :MAX_CANDIDATOS_TENDENCIA
-    ]
-
-
-def _historial_para_prompt(
-    limite=35
-):
-    historial = cargar_historial()[
-        -limite:
-    ]
-
-    salida = []
-
-    for item in historial:
-        salida.append({
-            "tema": item.get(
-                "tema",
-                ""
-            ),
-            "entidad": item.get(
-                "entidad",
-                ""
-            ),
-            "categoria": item.get(
-                "categoria",
-                ""
-            ),
-            "fecha": item.get(
-                "fecha"
-            ),
-        })
-
-    return salida
-
-
-def seleccionar_mejor_tendencia_gemini(
-    candidatos
-):
-    if not candidatos:
-        return None
-
-    candidatos_prompt = []
-
-    for i, c in enumerate(
-        candidatos[:55]
-    ):
-        candidatos_prompt.append({
-            "id": i,
-            "titulo": c.get(
-                "titulo",
-                ""
-            ),
-            "contexto": limitar_texto(
-                c.get(
-                    "contexto",
-                    ""
-                ),
-                420
-            ),
-            "senales": c.get(
-                "senales",
-                []
-            ),
-            "fuentes": c.get(
-                "fuentes",
-                []
-            ),
-            "trafico_google": c.get(
-                "trafico",
-                ""
-            ),
-            "score_preliminar": c.get(
-                "score_preliminar",
-                0
-            ),
-        })
-
-    prompt = f"""
-Eres editora de tendencias de "Miri te lo cuenta", un medio
-sobre cultura de Internet, virales, influencers, streamers,
-TikTokers, YouTubers, realities, famosos y polémicas que
-están generando conversación digital.
-
-Debes elegir UNA historia con potencial REAL para publicar ahora.
-
-CANDIDATOS:
-{json.dumps(candidatos_prompt, ensure_ascii=False)}
-
-HISTORIAL RECIENTE:
-{json.dumps(_historial_para_prompt(), ensure_ascii=False)}
-
-CRITERIOS, por orden:
-1. Tiene que estar ocurriendo o creciendo AHORA.
-2. Debe encajar claramente con cultura de Internet / entretenimiento.
-3. Mejor si aparece en más de una señal o fuente.
-4. Debe tener suficiente información verificable para un artículo.
-5. Evita repetir la misma noticia o prácticamente el mismo ángulo.
-6. Penaliza repetir una misma persona/programa demasiado seguido.
-7. Varía categorías: no llenes el medio solo de Telecinco/reality.
-8. Deporte, política, sucesos o economía solo si la conversación
-   online es el centro de la historia.
-9. No inventes que algo es tendencia si las señales no lo justifican.
-
-Devuelve SOLO JSON:
-{{
-  "id": 0,
-  "score": 0,
-  "entidad": "entidad principal",
-  "categoria": "TIKTOK|INFLUENCERS|STREAMERS|YOUTUBE|REALITY|TV|VIRAL|MEME|MUSICA|FAMOSOS|INTERNET",
-  "keywords": ["keyword1", "keyword2"],
-  "por_que_ahora": "explicación breve",
-  "angulo_articulo": "enfoque concreto y no repetido"
-}}
-
-score debe ser 0-100.
-Si ninguno merece publicarse, usa id=-1.
-"""
-
-    modelos = obtener_modelos_disponibles()
-
-    headers = {
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": prompt
-                    }
-                ]
-            }
-        ],
-        "generationConfig": {
-            "response_mime_type": "application/json",
-            "temperature": 0.25
-        }
-    }
-
-    for modelo in modelos:
-        m = modelo.lower()
-
-        if (
-            "image" in m
-            or "tts" in m
-            or "embedding" in m
-        ):
-            continue
-
-        url = (
-            "https://generativelanguage.googleapis.com/"
-            "v1beta/models/"
-            f"{modelo}:generateContent"
-            f"?key={GEMINI_API_KEY}"
-        )
-
-        try:
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=60
-            )
-
-            if response.status_code != 200:
-                continue
-
-            data = response.json()
-
-            raw = (
-                data["candidates"][0]
-                ["content"]
-                ["parts"][0]
-                ["text"]
-            )
-
-            seleccion = extraer_json_de_respuesta(
-                raw
-            )
-
-            idx = int(
-                seleccion.get(
-                    "id",
-                    -1
-                )
-            )
-
-            if (
-                idx < 0
-                or idx >= len(
-                    candidatos[:55]
-                )
-            ):
-                print(
-                    "⚠️ Gemini no eligió una candidata válida; "
-                    "se usará el mejor candidato por puntuación."
-                )
-                break
-
-            elegido = dict(
-                candidatos[
-                    idx
-                ]
-            )
-
-            elegido[
-                "score_tendencia"
-            ] = int(
-                seleccion.get(
-                    "score",
-                    elegido.get(
-                        "score_preliminar",
-                        0
-                    )
-                )
-            )
-
-            elegido[
-                "entidad"
-            ] = (
-                seleccion.get(
-                    "entidad",
-                    ""
-                )
-                or elegido.get(
-                    "entidad_sugerida",
-                    ""
-                )
-                or ""
-            ).strip()
-
-            elegido[
-                "categoria"
-            ] = (
-                seleccion.get(
-                    "categoria",
-                    ""
-                )
-                or elegido.get(
-                    "categoria_sugerida",
-                    ""
-                )
-                or "INTERNET"
-            ).strip()
-
-            elegido[
-                "keywords"
-            ] = deduplicar_lista(
-                asegurar_lista(
-                    seleccion.get(
-                        "keywords",
-                        []
-                    )
-                )
-            )[:10]
-
-            elegido[
-                "por_que_ahora"
-            ] = (
-                seleccion.get(
-                    "por_que_ahora",
-                    ""
-                )
-                or ""
-            ).strip()
-
-            elegido[
-                "angulo_articulo"
-            ] = (
-                seleccion.get(
-                    "angulo_articulo",
-                    ""
-                )
-                or ""
-            ).strip()
-
-            # Segunda comprobación de repetición con la entidad ya resuelta.
-            penalizacion, repeticion = penalizacion_historial(
-                elegido.get(
-                    "titulo",
-                    ""
-                ),
-                elegido.get(
-                    "entidad",
-                    ""
-                )
-            )
-
-            if repeticion:
-                print(
-                    "⚠️ Gemini eligió un tema demasiado repetido; "
-                    "se probará otro candidato."
-                )
-                break
-
-            elegido[
-                "score_tendencia"
-            ] -= min(
-                35,
-                penalizacion
-            )
-
-            return elegido
-
-        except Exception as e:
-            print(
-                f"⚠️ Selección de tendencia con {modelo}: {e}"
-            )
-
-    # Fallback sin Gemini: mejor score preliminar.
-    for candidato in candidatos:
-        if not candidato.get(
-            "repeticion_dura"
-        ):
-            candidato = dict(
-                candidato
-            )
-
-            candidato[
-                "score_tendencia"
-            ] = candidato.get(
-                "score_preliminar",
-                0
-            )
-
-            candidato[
-                "entidad"
-            ] = candidato.get(
-                "entidad_sugerida",
-                ""
-            )
-
-            candidato[
-                "categoria"
-            ] = candidato.get(
-                "categoria_sugerida",
-                "INTERNET"
-            )
-
-            candidato[
-                "keywords"
-            ] = tokenizar(
-                candidato.get(
-                    "titulo",
-                    ""
-                )
-            )[:8]
-
-            return candidato
-
-    return None
-
-
-def obtener_nuevo_tema_viral():
-    candidatos = construir_bolsa_tendencias()
-
-    print(
-        "📊 Candidatos útiles encontrados: "
-        f"{len(candidatos)}"
-    )
-
-    if not candidatos:
-        print(
-            "⚠️ No hay candidatos suficientes."
-        )
-        return None
-
-    restantes = list(
-        candidatos
-    )
-
-    intentos = min(
-        MAX_INTENTOS_VERIFICACION,
-        len(
-            restantes
-        )
-    )
-
-    respaldos_validos = []
-
-    for numero in range(
-        1,
-        intentos + 1
-    ):
-        elegido = seleccionar_mejor_tendencia_gemini(
-            restantes
-        )
-
-        if not elegido:
-            # Fallback directo al mejor candidato no repetido.
-            elegido = next(
-                (
-                    dict(c)
-                    for c in restantes
-                    if not c.get(
-                        "repeticion_dura"
-                    )
-                ),
-                None
-            )
-
-        if not elegido:
-            break
-
-        print(
-            f"🔎 Verificando candidata {numero}/{intentos}: "
-            f"{elegido.get('titulo')}"
-        )
-
-        investigacion = investigar_tema_actual(
-            elegido
-        )
-
-        publicable, motivo = investigacion_es_publicable(
-            investigacion
-        )
-
-        if publicable:
-            tema_corregido = (
-                investigacion.get(
-                    "tema_corregido",
-                    ""
-                )
-                or ""
-            ).strip()
-
-            if tema_corregido:
-                elegido[
-                    "titulo_original_detectado"
-                ] = elegido.get(
-                    "titulo",
-                    ""
-                )
-
-                elegido[
-                    "titulo"
-                ] = tema_corregido
-
-            elegido[
-                "_investigacion_verificada"
-            ] = investigacion
-
-            elegido[
-                "_modo_verificacion"
-            ] = "estricto"
-
-            print(
-                "✅ Tendencia verificada de forma estricta: "
-                f"{elegido.get('titulo')}"
-            )
-
-            return elegido
-
-        print(
-            "⚠️ Verificación estricta no superada: "
-            f"{motivo}"
-        )
-
-        respaldo_ok, motivo_respaldo = (
-            investigacion_es_publicable_respaldo(
-                investigacion,
-                elegido
-            )
-        )
-
-        if respaldo_ok:
-            investigacion_respaldo = preparar_investigacion_respaldo(
-                investigacion,
-                elegido
-            )
-
-            respaldos_validos.append(
-                (
-                    elegido,
-                    investigacion_respaldo
-                )
-            )
-
-            print(
-                "✅ La candidata queda disponible como respaldo "
-                "porque sí tiene evidencia real."
-            )
-        else:
-            print(
-                "🚫 También descartada como respaldo: "
-                f"{motivo_respaldo}"
-            )
-
-        # Quitar la candidata ya evaluada.
-        titulo_elegido = normalizar_texto(
-            elegido.get(
-                "titulo",
-                ""
-            )
-        )
-
-        restantes = [
-            c
-            for c in restantes
-            if normalizar_texto(
-                c.get(
-                    "titulo",
-                    ""
-                )
-            ) != titulo_elegido
-        ]
-
-        if not restantes:
-            break
-
-    # Si ninguna pasó el listón estricto pero sí tenemos una
-    # historia REAL con fuente, publicamos la mejor.
-    if respaldos_validos:
-        elegido, investigacion = respaldos_validos[0]
-
-        tema_corregido = (
-            investigacion.get(
-                "tema_corregido",
-                ""
-            )
-            or ""
-        ).strip()
-
-        if tema_corregido:
-            elegido[
-                "titulo_original_detectado"
-            ] = elegido.get(
-                "titulo",
-                ""
-            )
-
-            elegido[
-                "titulo"
-            ] = tema_corregido
-
-        elegido[
-            "_investigacion_verificada"
-        ] = investigacion
-
-        elegido[
-            "_modo_verificacion"
-        ] = "respaldo"
-
-        print(
-            "🟡 Se publicará con verificación de respaldo: "
-            f"{elegido.get('titulo')}"
-        )
-
-        return elegido
-
-    print(
-        "⚠️ No hay ninguna historia verificable con fuente real. "
-        "Esta ejecución no publicará."
-    )
-
-    return None
-
-
-def investigar_tema_actual(
-    tendencia
-):
-    """
-    Verificación editorial obligatoria.
-
-    La tendencia puede haber sido descubierta por Gemini, Trends
-    o RSS, pero aquí debe sobrevivir una segunda búsqueda.
-    """
-    if not tendencia:
-        return {}
-
-    prompt = f"""
-Comprueba en Google si esta historia es REAL, RECIENTE y tiene
-información suficiente para publicarse hoy en un medio español
-sobre cultura de Internet.
-
-TEMA:
-{tendencia.get('titulo', '')}
-
-CONTEXTO DETECTADO:
-{tendencia.get('contexto', '')}
-
-POR QUÉ AHORA:
-{tendencia.get('por_que_ahora', '')}
-
-ÁNGULO PROPUESTO:
-{tendencia.get('angulo_articulo', '')}
-
-REGLAS MUY IMPORTANTES:
-- No presupongas que es una tendencia porque el texto lo diga.
-- Comprueba expresamente si hay evidencia reciente.
-- Una noticia evergreen, un consejo antiguo o una publicación
-  aislada NO es suficiente.
-- No inventes una moda de TikTok a partir de un artículo
-  relacionado de forma vaga.
-- Si el titular inicial exagera o deforma los hechos, indícalo.
-- Si no se puede verificar, marca verificable=false.
-- Prioriza las últimas 48 h; admite hasta 7 días solo si sigue
-  siendo claramente conversación actual.
-
-Devuelve SOLO JSON:
-{{
-  "verificable": true,
-  "es_tendencia_real": true,
-  "confianza": 0,
-  "tema_corregido": "formulación factual y precisa del tema",
-  "resumen_verificado": "qué está ocurriendo realmente",
-  "hechos_confirmados": [
-    "hecho comprobable 1",
-    "hecho comprobable 2"
-  ],
-  "afirmaciones_a_evitar": [
-    "dato, exageración o rumor que no debe publicarse"
-  ],
-  "fuentes": [
-    {{
-      "nombre": "medio/sitio",
-      "url": "https://..."
-    }}
-  ]
-}}
-
-confianza: 0-100.
-"""
-
-    data = _gemini_google_search_json(
-        prompt,
-        timeout=90
-    )
-
-    return (
-        data
-        if isinstance(
-            data,
-            dict
-        )
-        else {}
-    )
-
-
-def investigacion_es_publicable(
-    investigacion
-):
-    """
-    Validación ESTRICTA.
-    Se intenta siempre primero.
-    """
-    if not isinstance(
-        investigacion,
-        dict
-    ):
-        return False, "sin investigación"
-
-    if investigacion.get(
-        "verificable"
-    ) is not True:
-        return False, "Google no la considera verificable"
-
-    if investigacion.get(
-        "es_tendencia_real"
-    ) is not True:
-        return False, "no se confirmó como tendencia/conversación actual"
-
-    try:
-        confianza = int(
-            investigacion.get(
-                "confianza",
-                0
-            )
-        )
-    except Exception:
-        confianza = 0
-
-    if confianza < MIN_CONFIANZA_INVESTIGACION:
-        return False, f"confianza insuficiente ({confianza})"
-
-    grounding = (
-        investigacion.get(
-            "_grounding_sources",
-            []
-        )
-        or []
-    )
-
-    if len(
-        grounding
-    ) < MIN_GROUNDING_INVESTIGACION:
-        return False, (
-            "menos de "
-            f"{MIN_GROUNDING_INVESTIGACION} fuentes reales de Google"
-        )
-
-    hechos = asegurar_lista(
-        investigacion.get(
-            "hechos_confirmados",
-            []
-        )
-    )
-
-    if len(
-        hechos
-    ) < 2:
-        return False, "menos de 2 hechos confirmados"
-
-    return True, "ok"
-
-
-def _fuentes_investigacion(
-    investigacion
-):
-    fuentes = []
-
-    if not isinstance(
-        investigacion,
-        dict
-    ):
-        return fuentes
-
-    for item in (
-        investigacion.get(
-            "_grounding_sources",
-            []
-        )
-        or []
-    ):
-        if isinstance(
-            item,
-            dict
-        ):
-            url = (
-                item.get(
-                    "url",
-                    ""
-                )
-                or ""
-            ).strip()
-
-            nombre = (
-                item.get(
-                    "titulo",
-                    ""
-                )
-                or ""
-            ).strip()
-
-            if url:
-                fuentes.append({
-                    "nombre": nombre,
-                    "url": url,
-                })
-
-    for item in asegurar_lista(
-        investigacion.get(
-            "fuentes",
-            []
-        )
-    ):
-        if isinstance(
-            item,
-            dict
-        ):
-            url = (
-                item.get(
-                    "url",
-                    ""
-                )
-                or ""
-            ).strip()
-
-            nombre = (
-                item.get(
-                    "nombre",
-                    ""
-                )
-                or ""
-            ).strip()
-
-            if url:
-                fuentes.append({
-                    "nombre": nombre,
-                    "url": url,
-                })
-
-    # Deduplicar por URL.
-    vistos = set()
-    salida = []
-
-    for item in fuentes:
-        url = item.get(
-            "url",
-            ""
-        )
-
-        if (
-            url
-            and url not in vistos
-        ):
-            vistos.add(
-                url
-            )
-            salida.append(
-                item
-            )
-
-    return salida
-
-
-def investigacion_es_publicable_respaldo(
-    investigacion,
-    tendencia
-):
-    """
-    Respaldo para que el bot no deje de publicar solo porque
-    Gemini/Google Search no devuelva groundingMetadata.
-
-    NO acepta una ocurrencia inventada por el módulo social.
-    Exige:
-    - historia verificable;
-    - información concreta;
-    - y evidencia de una fuente real o de varias señales/fuentes
-      recogidas por Google News/RSS/Trends.
-    """
-    if not isinstance(
-        investigacion,
-        dict
-    ):
-        return False, "sin investigación"
-
-    verificable = investigacion.get(
-        "verificable"
-    )
-
-    if verificable is not True:
-        return False, "la historia no se verificó como real"
-
-    try:
-        confianza = int(
-            investigacion.get(
-                "confianza",
-                0
-            )
-        )
-    except Exception:
-        confianza = 0
-
-    if confianza < 55:
-        return False, f"confianza de respaldo insuficiente ({confianza})"
-
-    hechos = asegurar_lista(
-        investigacion.get(
-            "hechos_confirmados",
-            []
-        )
-    )
-
-    if not hechos:
-        return False, "sin hechos confirmados"
-
-    fuentes_investigacion = _fuentes_investigacion(
-        investigacion
-    )
-
-    url_candidata = (
-        tendencia.get(
-            "url",
-            ""
-        )
-        or ""
-    ).strip()
-
-    fuentes_candidata = deduplicar_lista(
-        asegurar_lista(
-            tendencia.get(
-                "fuentes",
-                []
-            )
-        )
-    )
-
-    senales = deduplicar_lista(
-        asegurar_lista(
-            tendencia.get(
-                "senales",
-                []
-            )
-        )
-    )
-
-    # Las sugerencias puramente sociales de Gemini NO pueden
-    # pasar por el respaldo si no hay una fuente web concreta.
-    es_solo_social_gemini = (
-        senales
-        and all(
-            str(s).strip().lower() == "google_search_social"
-            for s in senales
-        )
-        and not url_candidata
-        and not fuentes_investigacion
-    )
-
-    if es_solo_social_gemini:
-        return False, "candidata social sin fuente independiente"
-
-    if (
-        fuentes_investigacion
-        or url_candidata
-        or len(
-            fuentes_candidata
-        ) >= 2
-    ):
-        return True, "respaldo con fuente real"
-
-    return False, "sin evidencia externa suficiente"
-
-
-def preparar_investigacion_respaldo(
-    investigacion,
-    tendencia
-):
-    """
-    Completa la investigación con la fuente original de la
-    candidata para que el redactor tenga contexto factual.
-    """
-    salida = dict(
-        investigacion
-        if isinstance(
-            investigacion,
-            dict
-        )
-        else {}
-    )
-
-    fuentes = _fuentes_investigacion(
-        salida
-    )
-
-    url = (
-        tendencia.get(
-            "url",
-            ""
-        )
-        or ""
-    ).strip()
-
-    fuente_nombre = (
-        tendencia.get(
-            "fuente",
-            ""
-        )
-        or ""
-    ).strip()
-
-    if url and not any(
-        f.get(
-            "url"
-        ) == url
-        for f in fuentes
-    ):
-        fuentes.append({
-            "nombre": fuente_nombre,
-            "url": url,
-        })
-
-    if fuentes:
-        salida[
-            "fuentes"
-        ] = fuentes
-
-    # Si Google confirma que la historia es real pero no que sea
-    # literalmente una "tendencia", el artículo podrá publicarse
-    # como actualidad/Internet sin llamarla tendencia.
-    if salida.get(
-        "es_tendencia_real"
-    ) is not True:
-        salida[
-            "es_tendencia_real"
-        ] = False
-
-    return salida
-
 
 
 # ==========================================
@@ -3048,12 +580,12 @@ def obtener_modelos_disponibles():
         pass
 
     return [
-        "gemini-2.5-flash",
-        "gemini-2.5-pro"
+        "gemini-1.5-flash",
+        "gemini-1.5-pro"
     ]
 
 
-def generar_articulo_miri(tema_viral, investigacion=None, tendencia=None):
+def generar_articulo_miri(tema_viral):
     modelos = obtener_modelos_disponibles()
 
     prompt = f"""
@@ -3065,30 +597,10 @@ de salseo sobre esta tendencia:
 
 "{tema_viral}"
 
-CONTEXTO DE TENDENCIA:
-{json.dumps(tendencia or {}, ensure_ascii=False)}
-
-INVESTIGACIÓN WEB PREVIA:
-{json.dumps(investigacion or {}, ensure_ascii=False)}
-
 IMPORTANTE:
-- Basa TODOS los hechos concretos en la investigación previa.
-- Si la investigación dice que algo no está confirmado, no lo presentes como hecho.
-- Si falta una fecha o dato oficial, dilo claramente en vez de rellenarlo.
 - No inventes hechos concretos que no estén justificados.
 - No inventes declaraciones textuales.
-- NO llames a algo "moda", "reto", "tendencia" o "viral" salvo que la
-  investigación verificada confirme expresamente que lo es.
-- Si la historia está verificada pero es_tendencia_real=false,
-  trátala como noticia/actualidad de Internet, no como "tendencia".
-- No transformes un consejo, un vídeo aislado o un artículo evergreen
-  en una supuesta tendencia de TikTok.
-- Evita titulares que den asco, ridiculicen o exageren si eso no está
-  respaldado por los hechos.
-- Tono cercano y con personalidad, pero periodístico: evita muletillas
-  repetitivas como "agárrate fuerte", "internet se ha vuelto a superar",
-  "mirilovers" o "familia de Miri".
-- Separa claramente hecho, contexto y reacción de usuarios.
+- El contenido debe sonar natural y periodístico.
 - El artículo debe tener entre 4 y 7 párrafos cortos.
 - Responde ÚNICAMENTE con un objeto JSON válido.
 - No uses Markdown.
@@ -3099,7 +611,7 @@ Devuelve EXACTAMENTE:
   "titulo": "Titular llamativo y claro",
   "contenido_html": "<p>Primer párrafo...</p><p>Segundo párrafo...</p>",
   "titulo_miniatura": "TITULAR CORTO PARA LA MINIATURA",
-  "categoria_visual": "ESTÁ PASANDO / SE HA LIADO / TE PONGO EN CONTEXTO / INTERNET ESTÁ HABLANDO / ¿QUIÉN ES? / MIRI REACCIONA / REALITY / VIRAL / INTERNET",
+  "categoria_visual": "VIRAL / REDES / TELECINCO / REALITY / ACTUALIDAD",
   "tipo_visual": "persona | programa | marca | evento | lugar | tema",
   "entidad_principal": "entidad visual principal",
   "contexto_visual": "contexto breve para evitar resultados erróneos",
@@ -3310,7 +822,6 @@ REGLAS EDITORIALES PARA ELEGIR LA IMAGEN:
     raise Exception(
         "❌ Error crítico: Gemini no pudo generar el artículo."
     )
-
 
 
 # ==========================================
@@ -5716,7 +3227,7 @@ def publicar_en_wordpress(
             f"Link: {post_data.get('link')}"
         )
 
-        return post_data
+        return True
 
     raise Exception(
         "❌ Error crítico al publicar entrada "
@@ -5729,90 +3240,32 @@ def publicar_en_wordpress(
 # 21. EJECUCIÓN PRINCIPAL
 # ==========================================
 if __name__ == "__main__":
-    objetivo = articulos_mes_efectivos()
-
     print(
-        "🗓️ Configuración editorial:"
-    )
-    print(
-        f"   - Objetivo: {objetivo} artículos/mes"
-    )
-    print(
-        "   - Intervalo medio este mes: "
-        f"{intervalo_objetivo_horas():.1f} h"
-    )
-    print(
-        "   - Metricool: "
-        f"{METRICOOL_PUBLICACIONES_MES} publicaciones/mes; "
-        "1 publicación por artículo (Instagram)"
-    )
-    print(
-        "   - Facebook: compartido automáticamente desde Instagram "
-        "(no cuenta en Metricool)"
-    )
-    print(
-        "   - Imagen: sistema original de miniatura 1200x630"
+        "🗓️ Bot estable: sistema antiguo + "
+        f"intervalo de {INTERVALO_PUBLICACION_HORAS:.1f} h."
     )
 
-    if not puede_publicar_ahora():
+    if not puede_publicar_por_frecuencia():
+        raise SystemExit(0)
+
+    tema = obtener_nuevo_tema_viral()
+
+    if not tema:
         print(
-            "ℹ️ Fin normal: esta ejecución queda bloqueada "
-            "únicamente por el intervalo/cuota."
+            "⚠️ Sin temas nuevos. Usando tema de prueba..."
         )
-        raise SystemExit(0)
+
+        tema = (
+            "Polémica viral de la semana "
+            "en redes sociales"
+        )
 
     print(
-        "✅ La frecuencia permite publicar en esta ejecución."
-    )
-
-    tendencia = obtener_nuevo_tema_viral()
-
-    if not tendencia:
-        # Ya no existe tema de prueba: si no hay tendencia buena,
-        # no se publica por publicar.
-        raise SystemExit(0)
-
-    tema = tendencia.get(
-        "titulo",
-        ""
-    )
-
-    investigacion = tendencia.get(
-        "_investigacion_verificada",
-        {}
-    )
-
-    modo_verificacion = tendencia.get(
-        "_modo_verificacion",
-        "estricto"
-    )
-
-    if modo_verificacion == "respaldo":
-        publicable, motivo = investigacion_es_publicable_respaldo(
-            investigacion,
-            tendencia
-        )
-    else:
-        publicable, motivo = investigacion_es_publicable(
-            investigacion
-        )
-
-    if not publicable:
-        print(
-            "🚫 Seguridad editorial: no se publicará el artículo. "
-            f"Motivo: {motivo}"
-        )
-        raise SystemExit(0)
-
-    print(
-        "🛡️ Modo de verificación editorial: "
-        f"{modo_verificacion}"
+        f"🔥 Tema seleccionado: {tema}"
     )
 
     articulo = generar_articulo_miri(
-        tema,
-        investigacion=investigacion,
-        tendencia=tendencia
+        tema
     )
 
     titulo = articulo[
@@ -5859,9 +3312,13 @@ if __name__ == "__main__":
     print(
         f"🎯 Entidad principal: {entidad_principal}"
     )
+    print(
+        f"🧭 Contexto visual: {contexto_visual}"
+    )
+    print(
+        f"🔎 Búsquedas imagen: {busquedas_imagen}"
+    )
 
-    # Miniatura del artículo: sistema ORIGINAL.
-    # Sin vídeo, sin frame vertical y sin piezas sociales extra.
     ruta_imagen, info_imagen = generar_miniatura(
         titulo_miniatura=titulo_miniatura,
         categoria_visual=categoria_visual,
@@ -5871,7 +3328,6 @@ if __name__ == "__main__":
         busquedas_imagen=busquedas_imagen
     )
 
-    # Crédito/licencia dentro del artículo cuando proceda.
     if info_imagen:
         credito = construir_credito_html(
             info_imagen
@@ -5881,52 +3337,13 @@ if __name__ == "__main__":
             contenido_html += credito
 
     if titulo and contenido_html:
-        post_data = publicar_en_wordpress(
+        publicado = publicar_en_wordpress(
             titulo,
             contenido_html,
             ruta_imagen
         )
 
-        if post_data:
-            url_articulo = (
-                post_data.get(
-                    "link"
-                )
-                or ""
-            )
-
-            print(
-                "🖼️ Publicación simplificada: "
-                "solo artículo + imagen destacada original."
-            )
-
+        if publicado:
             guardar_en_historial(
-                tema=tema,
-                titulo=titulo,
-                entidad=(
-                    tendencia.get(
-                        "entidad"
-                    )
-                    or entidad_principal
-                ),
-                categoria=(
-                    tendencia.get(
-                        "categoria"
-                    )
-                    or categoria_visual
-                ),
-                keywords=tendencia.get(
-                    "keywords",
-                    []
-                ),
-                fuente=", ".join(
-                    tendencia.get(
-                        "fuentes",
-                        []
-                    )
-                ),
-                url=url_articulo,
-                score_tendencia=tendencia.get(
-                    "score_tendencia"
-                )
+                tema
             )
