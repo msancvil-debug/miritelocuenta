@@ -316,142 +316,48 @@ def limitar_texto(texto, max_len=95):
     return texto[:max_len - 1].rstrip() + "…"
 
 
-def titulo_social_es_valido(texto):
-    texto = re.sub(
-        r"\s+",
-        " ",
-        str(texto or "").strip()
-    )
-
-    if not texto:
-        return False
-
-    if len(texto) > 100:
-        return False
-
-    if len(texto) < 45:
-        return False
-
-    ultima = normalizar_texto(
-        texto.rstrip(
-            " .!?…:;,—-"
-        ).split()[-1]
-        if texto.split()
-        else ""
-    )
-
-    # Palabras que suelen indicar que una frase se ha cortado.
-    finales_incompletos = {
-        "de", "del", "la", "las", "el", "los",
-        "un", "una", "unos", "unas",
-        "que", "y", "o", "en", "con", "por",
-        "para", "sin", "sobre", "al",
-        "es", "son", "ha", "han", "se",
-        "su", "sus", "como", "cuando",
-    }
-
-    if ultima in finales_incompletos:
-        return False
-
-    return True
-
-
-def titulo_social_fallback(titulo_articulo, tema_viral):
-    """
-    Fallback SIN cortar frases por caracteres.
-    Busca una cláusula completa de menos de 100 caracteres.
-    Si no existe una opción segura, devuelve cadena vacía.
-    """
-    fuentes = [
-        str(titulo_articulo or "").strip(),
-        str(tema_viral or "").strip(),
-    ]
-
-    candidatos = []
-
-    for fuente in fuentes:
-        fuente = re.sub(
-            r"\s+",
-            " ",
-            fuente
-        ).strip()
-
-        if not fuente:
-            continue
-
-        if titulo_social_es_valido(
-            fuente
-        ):
-            candidatos.append(
-                fuente
-            )
-
-        # Separar ganchos iniciales y cláusulas completas.
-        trozos = re.split(
-            r"(?<=[.!?])\s+|\s+[—–-]\s+|:\s+",
-            fuente
-        )
-
-        for trozo in trozos:
-            trozo = trozo.strip(
-                " —–-"
-            )
-
-            if titulo_social_es_valido(
-                trozo
-            ):
-                candidatos.append(
-                    trozo
-                )
-
-        # Muy útil para titulares del tipo:
-        # "¡Gancho! Persona hace X..."
-        if "!" in fuente:
-            resto = fuente.split(
-                "!",
-                1
-            )[1].strip()
-
-            if titulo_social_es_valido(
-                resto
-            ):
-                candidatos.append(
-                    resto
-                )
-
-    if not candidatos:
-        return ""
-
-    # Preferir el más descriptivo sin pasar de 100.
-    candidatos = sorted(
-        set(
-            candidatos
-        ),
-        key=lambda x: (
-            len(x),
-            len(
-                set(
-                    tokenizar(x)
-                )
-            )
-        ),
-        reverse=True
-    )
-
-    return candidatos[0]
-
-
 def construir_titulo_social(titulo_articulo, tema_viral):
     """
-    Compatibilidad con el flujo anterior.
-    Ya NO recorta a 100 caracteres: devuelve una frase completa
-    o cadena vacía.
+    Genera los primeros caracteres del artículo para que sirvan
+    como texto buscable en YouTube, TikTok, Instagram y Facebook,
+    SIN tocar el prompt ni la lógica del generador de imágenes.
     """
-    return titulo_social_fallback(
-        titulo_articulo,
-        tema_viral
+    titulo_articulo = re.sub(
+        r"\s+",
+        " ",
+        str(titulo_articulo or "").strip()
     )
 
+    tema_viral = re.sub(
+        r"\s+",
+        " ",
+        str(tema_viral or "").strip()
+    )
+
+    base = titulo_articulo or tema_viral
+
+    if len(base) < 80 and tema_viral and base.lower() not in tema_viral.lower():
+        candidato = f"{base} — {tema_viral}"
+
+        if len(candidato) <= 100:
+            base = candidato
+
+    base = re.sub(
+        r"\s+",
+        " ",
+        base
+    ).strip()
+
+    # Máximo 100 caracteres.
+    if len(base) > 100:
+        recorte = base[:100]
+
+        if " " in recorte:
+            recorte = recorte.rsplit(" ", 1)[0]
+
+        base = recorte.rstrip(" ,;:-")
+
+    return base
 
 
 def extraer_json_de_respuesta(raw_text):
@@ -2655,12 +2561,6 @@ IMPORTANTE:
 - No inventes hechos concretos que no estén justificados.
 - No inventes declaraciones textuales.
 - El contenido debe sonar natural y periodístico.
-- Escribe en español correcto y natural de España.
-- Revisa ORTOGRAFÍA, tildes, puntuación y concordancia antes de responder.
-- No inventes palabras ni deformes expresiones conocidas.
-- NO dejes ninguna frase a medias ni ningún párrafo cortado.
-- Todos los párrafos deben terminar con una frase completa.
-- El titular también debe estar ortográfica y gramaticalmente correcto.
 - El artículo debe tener entre 4 y 7 párrafos cortos.
 - Responde ÚNICAMENTE con un objeto JSON válido.
 - No uses Markdown.
@@ -2882,225 +2782,6 @@ REGLAS EDITORIALES PARA ELEGIR LA IMAGEN:
     raise Exception(
         "❌ Error crítico: Gemini no pudo generar el artículo."
     )
-
-
-
-# ==========================================
-# 5B. REVISIÓN EDITORIAL DEL TEXTO
-# ==========================================
-def revisar_articulo_y_crear_titulo_social(
-    titulo,
-    contenido_html,
-    tema_viral
-):
-    """
-    Segunda pasada SOLO editorial.
-
-    Corrige:
-    - ortografía
-    - tildes
-    - puntuación
-    - concordancia
-    - frases incompletas
-
-    Y crea un título social COMPLETO de <=100 caracteres.
-
-    NO recibe ni devuelve datos visuales, de modo que no puede
-    alterar el generador de imágenes.
-    """
-    modelos = obtener_modelos_disponibles()
-
-    prompt = f"""
-Actúa como correctora profesional de español de España.
-
-Tienes que revisar un artículo ya redactado para "Miri te lo cuenta".
-
-TEMA:
-{tema_viral}
-
-TÍTULO ACTUAL:
-{titulo}
-
-CUERPO HTML ACTUAL:
-{contenido_html}
-
-Haz ÚNICAMENTE estas tareas:
-
-1. Corrige faltas de ortografía, tildes, puntuación,
-   concordancia y errores gramaticales.
-2. Corrige palabras mal escritas o expresiones deformadas.
-3. Asegúrate de que TODAS las frases estén completas.
-4. NO cortes ninguna oración.
-5. NO resumas el artículo.
-6. NO elimines información.
-7. NO añadas hechos nuevos, nombres, cifras, declaraciones
-   ni datos que no estén ya en el texto.
-8. Mantén los mismos párrafos HTML <p>...</p>.
-9. Mantén el tono ágil y de cultura de Internet, pero evita
-   muletillas artificiales y errores de redacción.
-10. Crea "titulo_social":
-    - máximo 100 caracteres;
-    - mínimo 55;
-    - frase o titular COMPLETO, nunca cortado;
-    - sin puntos suspensivos;
-    - sin hashtags;
-    - con el tema/persona/plataforma principal lo antes posible;
-    - pensado para búsquedas en TikTok, YouTube,
-      Instagram y Facebook;
-    - ortografía impecable.
-11. El título principal puede seguir siendo llamativo, pero
-    debe ser correcto y NO usar palabras inexistentes por error.
-
-Devuelve SOLO JSON válido:
-
-{{
-  "titulo_corregido": "título principal corregido",
-  "contenido_html_corregido": "<p>...</p><p>...</p>",
-  "titulo_social": "titular completo de 55 a 100 caracteres"
-}}
-"""
-
-    headers = {
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": prompt
-                    }
-                ]
-            }
-        ],
-        "generationConfig": {
-            "response_mime_type": "application/json",
-            "temperature": 0.1
-        }
-    }
-
-    for modelo in modelos:
-        m = modelo.lower()
-
-        if (
-            "image" in m
-            or "tts" in m
-            or "embedding" in m
-        ):
-            continue
-
-        url = (
-            "https://generativelanguage.googleapis.com/"
-            "v1beta/models/"
-            f"{modelo}:generateContent"
-            f"?key={GEMINI_API_KEY}"
-        )
-
-        try:
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=60
-            )
-
-            if response.status_code != 200:
-                continue
-
-            data = response.json()
-
-            raw = (
-                data["candidates"][0]
-                ["content"]
-                ["parts"][0]
-                ["text"]
-            )
-
-            revisado = extraer_json_de_respuesta(
-                raw
-            )
-
-            if not isinstance(
-                revisado,
-                dict
-            ):
-                continue
-
-            titulo_corregido = html.unescape(
-                str(
-                    revisado.get(
-                        "titulo_corregido",
-                        ""
-                    )
-                    or ""
-                )
-            ).strip()
-
-            html_corregido = str(
-                revisado.get(
-                    "contenido_html_corregido",
-                    ""
-                )
-                or ""
-            ).strip()
-
-            titulo_social = html.unescape(
-                str(
-                    revisado.get(
-                        "titulo_social",
-                        ""
-                    )
-                    or ""
-                )
-            ).strip()
-
-            titulo_social = re.sub(
-                r"\s+",
-                " ",
-                titulo_social
-            ).strip()
-
-            # Validación básica para no aceptar una revisión rota.
-            if not titulo_corregido:
-                titulo_corregido = titulo
-
-            if (
-                not html_corregido
-                or "<p" not in html_corregido.lower()
-            ):
-                html_corregido = contenido_html
-
-            # Si Gemini incumple los 100 caracteres o deja
-            # un título a medias, usamos un fallback que NO corta.
-            if not titulo_social_es_valido(
-                titulo_social
-            ):
-                titulo_social = titulo_social_fallback(
-                    titulo_corregido,
-                    tema_viral
-                )
-
-            return {
-                "titulo": titulo_corregido,
-                "contenido_html": html_corregido,
-                "titulo_social": titulo_social,
-            }
-
-        except Exception as exc:
-            print(
-                f"⚠️ Revisión editorial con {modelo}: {exc}"
-            )
-
-    # Si la revisión falla, no tocamos el artículo.
-    return {
-        "titulo": titulo,
-        "contenido_html": contenido_html,
-        "titulo_social": titulo_social_fallback(
-            titulo,
-            tema_viral
-        ),
-    }
 
 
 # ==========================================
@@ -5562,55 +5243,29 @@ if __name__ == "__main__":
         "contenido_html"
     ]
 
-    revision = revisar_articulo_y_crear_titulo_social(
-        titulo=titulo,
-        contenido_html=contenido_html,
-        tema_viral=tema
+    titulo_social = construir_titulo_social(
+        titulo,
+        tema
     )
 
-    titulo = revision.get(
-        "titulo",
-        titulo
-    )
-
-    contenido_html = revision.get(
-        "contenido_html",
+    texto_visible = re.sub(
+        r"<[^>]+>",
+        " ",
         contenido_html
     )
-
-    titulo_social = revision.get(
-        "titulo_social",
-        ""
+    texto_visible = html.unescape(
+        texto_visible
     )
+    texto_visible = re.sub(
+        r"\s+",
+        " ",
+        texto_visible
+    ).strip()
 
-    # Solo se inserta si es una frase COMPLETA y <=100 caracteres.
-    if titulo_social_es_valido(
-        titulo_social
-    ):
-        texto_visible = re.sub(
-            r"<[^>]+>",
-            " ",
-            contenido_html
-        )
-        texto_visible = html.unescape(
-            texto_visible
-        )
-        texto_visible = re.sub(
-            r"\s+",
-            " ",
-            texto_visible
-        ).strip()
-
-        if not texto_visible.startswith(
-            titulo_social
-        ):
-            contenido_html = (
-                f"<p>{html.escape(titulo_social)}</p>"
-                + contenido_html
-            )
-    else:
-        print(
-            "⚠️ No se insertará un título social incompleto."
+    if not texto_visible.startswith(titulo_social):
+        contenido_html = (
+            f"<p>{html.escape(titulo_social)}</p>"
+            + contenido_html
         )
 
     titulo_miniatura = articulo[
@@ -5641,9 +5296,8 @@ if __name__ == "__main__":
         f"📰 Título artículo: {titulo}"
     )
     print(
-        "🔎 Título social completo "
-        f"({len(titulo_social or '')}/100): "
-        f"{titulo_social or 'no generado'}"
+        "🔎 Primeros caracteres para redes "
+        f"({len(titulo_social)}/100): {titulo_social}"
     )
     print(
         f"🖼️ Título miniatura: {titulo_miniatura}"
