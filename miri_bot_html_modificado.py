@@ -7,6 +7,9 @@ import mimetypes
 import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote_plus
 from io import BytesIO
 
 from PIL import Image, ImageDraw, ImageFont, ImageStat
@@ -81,10 +84,84 @@ EJECUCION_MANUAL_GITHUB = (
     or GITHUB_RUN_ATTEMPT > 1
 )
 
-FEEDS_TENDENCIAS = [
-    "https://news.google.com/rss/search?q=viral+OR+tiktok+OR+telecinco+OR+reality&hl=es&gl=ES&ceid=ES:es",
+# ============================================================
+# MOTOR DE TENDENCIAS · MIRI TE LO CUENTA
+# ============================================================
+# Se mantiene el bot estable de publicación e imágenes.
+# SOLO se amplía la forma de elegir el tema.
+#
+# Fuentes:
+# - Google Trends España
+# - búsquedas verticales en Google News
+# - Gemini + Google Search para conversación social reciente
+# - 20minutos como señal secundaria, nunca como fuente dominante
+
+GOOGLE_TRENDS_RSS = "https://trends.google.com/trending/rss?geo=ES"
+
+GOOGLE_NEWS_QUERIES = [
+    "TikTok España influencer viral polémica when:2d",
+    "influencer España creador contenido polémica viral when:2d",
+    "youtuber YouTube España polémica viral when:2d",
+    "streamer España Twitch Kick polémica viral when:2d",
+    "Instagram España influencer viral polémica when:2d",
+    "creador de contenido España viral polémica when:2d",
+    "meme viral Internet España when:2d",
+    "vídeo viral redes sociales España when:2d",
+    "música viral TikTok España when:2d",
+    "fandom España viral redes sociales when:2d",
+    "famoso influencer ruptura polémica redes España when:2d",
+    "reality España redes sociales viral when:2d",
+    "Telecinco reality redes sociales viral when:2d",
+]
+
+FEEDS_GENERALES = [
     "https://20minutos.es/rss/"
 ]
+
+MAX_CANDIDATOS_TENDENCIA = int(
+    os.environ.get(
+        "MAX_CANDIDATOS_TENDENCIA",
+        "70"
+    )
+)
+
+COOLDOWN_ENTIDAD_DIAS = int(
+    os.environ.get(
+        "COOLDOWN_ENTIDAD_DIAS",
+        "7"
+    )
+)
+
+HISTORIAL_REPETICION_DIAS = int(
+    os.environ.get(
+        "HISTORIAL_REPETICION_DIAS",
+        "30"
+    )
+)
+
+UMBRAL_SIMILITUD_TEMA = float(
+    os.environ.get(
+        "UMBRAL_SIMILITUD_TEMA",
+        "0.72"
+    )
+)
+
+# Preferencia editorial. NO son cuotas rígidas.
+# Sirven para que Telecinco/TV no gane por pura abundancia de noticias.
+PESO_CATEGORIA_EDITORIAL = {
+    "INFLUENCERS": 24,
+    "TIKTOK": 22,
+    "STREAMERS": 21,
+    "YOUTUBE": 20,
+    "CREADORES": 20,
+    "VIRAL": 19,
+    "MEME": 18,
+    "INTERNET": 15,
+    "MUSICA": 12,
+    "FAMOSOS": 10,
+    "REALITY": 3,
+    "TV": -8,
+}
 
 HEADERS_BROWSER = {
     "User-Agent": (
@@ -517,26 +594,37 @@ def puede_publicar_por_frecuencia():
 # 4. HISTORIAL Y TENDENCIAS
 # ==========================================
 def cargar_historial():
-    if os.path.exists(HISTORIAL_FILE):
-        try:
-            with open(
-                HISTORIAL_FILE,
-                "r",
-                encoding="utf-8"
-            ) as f:
-                data = json.load(f)
-                return data if isinstance(data, list) else []
-        except Exception:
-            return []
+    """
+    Compatible con el historial antiguo (lista de strings)
+    y con futuros registros estructurados.
+    """
+    if not os.path.exists(HISTORIAL_FILE):
+        return []
 
-    return []
+    try:
+        with open(
+            HISTORIAL_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+            data = json.load(f)
+
+        return data if isinstance(data, list) else []
+
+    except Exception:
+        return []
 
 
 def guardar_en_historial(tema):
+    """
+    Se mantiene compatible con el flujo estable.
+    """
     historial = cargar_historial()
 
     if tema not in historial:
         historial.append(tema)
+
+    historial = historial[-250:]
 
     with open(
         HISTORIAL_FILE,
@@ -552,9 +640,11 @@ def guardar_en_historial(tema):
 
 
 def limpiar_titulo_feed(title):
-    title = (title or "").strip()
+    title = html.unescape(
+        (title or "").strip()
+    )
 
-    # Elimina sufijos típicos tipo " - Medio X"
+    # Elimina sufijos típicos tipo " - Medio X".
     title = re.sub(
         r"\s+-\s+[^-]{2,60}$",
         "",
@@ -564,10 +654,738 @@ def limpiar_titulo_feed(title):
     return title
 
 
-def obtener_nuevo_tema_viral():
-    historial = cargar_historial()
+def _parse_fecha_tendencia(valor):
+    if not valor:
+        return None
 
-    for feed_url in FEEDS_TENDENCIAS:
+    if isinstance(valor, datetime):
+        dt = valor
+
+    else:
+        texto = str(valor).strip()
+
+        try:
+            dt = datetime.fromisoformat(
+                texto.replace(
+                    "Z",
+                    "+00:00"
+                )
+            )
+        except Exception:
+            try:
+                dt = parsedate_to_datetime(
+                    texto
+                )
+            except Exception:
+                return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(
+            tzinfo=timezone.utc
+        )
+
+    return dt.astimezone(
+        timezone.utc
+    )
+
+
+def _texto_local_tag(elem, nombre):
+    for child in elem.iter():
+        tag = str(
+            child.tag
+        ).split(
+            "}"
+        )[-1]
+
+        if tag == nombre:
+            return (
+                child.text
+                or ""
+            ).strip()
+
+    return ""
+
+
+def _fecha_item_rss(item):
+    for nombre in [
+        "pubDate",
+        "published",
+        "updated",
+    ]:
+        texto = _texto_local_tag(
+            item,
+            nombre
+        )
+
+        fecha = _parse_fecha_tendencia(
+            texto
+        )
+
+        if fecha:
+            return fecha.isoformat()
+
+    return ""
+
+
+def similaridad_tendencia(a, b):
+    a_norm = normalizar_texto(
+        a
+    )
+    b_norm = normalizar_texto(
+        b
+    )
+
+    if not a_norm or not b_norm:
+        return 0.0
+
+    seq = SequenceMatcher(
+        None,
+        a_norm,
+        b_norm
+    ).ratio()
+
+    a_tokens = set(
+        tokenizar(
+            a_norm
+        )
+    )
+    b_tokens = set(
+        tokenizar(
+            b_norm
+        )
+    )
+
+    if a_tokens and b_tokens:
+        jac = len(
+            a_tokens & b_tokens
+        ) / max(
+            1,
+            len(
+                a_tokens | b_tokens
+            )
+        )
+    else:
+        jac = 0.0
+
+    return max(
+        seq,
+        jac
+    )
+
+
+def crear_candidato_tendencia(
+    titulo,
+    fuente,
+    url="",
+    contexto="",
+    senal="",
+    fecha="",
+    trafico="",
+    score_base=0,
+    categoria="",
+    entidad=""
+):
+    titulo = limpiar_titulo_feed(
+        titulo
+    )
+
+    if not titulo:
+        return None
+
+    return {
+        "titulo": titulo,
+        "fuente": (
+            fuente
+            or ""
+        ).strip(),
+        "url": (
+            url
+            or ""
+        ).strip(),
+        "contexto": (
+            contexto
+            or ""
+        ).strip(),
+        "senales": [
+            senal
+        ] if senal else [],
+        "fuentes": [
+            fuente
+        ] if fuente else [],
+        "fecha": fecha,
+        "trafico": (
+            trafico
+            or ""
+        ).strip(),
+        "score_base": int(
+            score_base
+            or 0
+        ),
+        "categoria_sugerida": (
+            categoria
+            or ""
+        ).strip().upper(),
+        "entidad_sugerida": (
+            entidad
+            or ""
+        ).strip(),
+    }
+
+
+def fusionar_candidatos_tendencia(candidatos):
+    """
+    Une la misma historia cuando aparece en varias fuentes/señales.
+    """
+    fusionados = []
+
+    for candidato in candidatos:
+        if not candidato:
+            continue
+
+        mejor = None
+        mejor_sim = 0.0
+
+        for existente in fusionados:
+            sim = similaridad_tendencia(
+                candidato.get(
+                    "titulo",
+                    ""
+                ),
+                existente.get(
+                    "titulo",
+                    ""
+                )
+            )
+
+            if sim > mejor_sim:
+                mejor_sim = sim
+                mejor = existente
+
+        if (
+            mejor is not None
+            and mejor_sim >= 0.82
+        ):
+            mejor[
+                "score_base"
+            ] = max(
+                mejor.get(
+                    "score_base",
+                    0
+                ),
+                candidato.get(
+                    "score_base",
+                    0
+                )
+            ) + 8
+
+            mejor[
+                "fuentes"
+            ] = deduplicar_lista(
+                mejor.get(
+                    "fuentes",
+                    []
+                )
+                + candidato.get(
+                    "fuentes",
+                    []
+                )
+            )
+
+            mejor[
+                "senales"
+            ] = deduplicar_lista(
+                mejor.get(
+                    "senales",
+                    []
+                )
+                + candidato.get(
+                    "senales",
+                    []
+                )
+            )
+
+            if len(
+                candidato.get(
+                    "contexto",
+                    ""
+                )
+            ) > len(
+                mejor.get(
+                    "contexto",
+                    ""
+                )
+            ):
+                mejor[
+                    "contexto"
+                ] = candidato.get(
+                    "contexto",
+                    ""
+                )
+
+            if (
+                not mejor.get(
+                    "url"
+                )
+                and candidato.get(
+                    "url"
+                )
+            ):
+                mejor[
+                    "url"
+                ] = candidato.get(
+                    "url"
+                )
+
+            if (
+                not mejor.get(
+                    "categoria_sugerida"
+                )
+                and candidato.get(
+                    "categoria_sugerida"
+                )
+            ):
+                mejor[
+                    "categoria_sugerida"
+                ] = candidato.get(
+                    "categoria_sugerida"
+                )
+
+            if (
+                not mejor.get(
+                    "entidad_sugerida"
+                )
+                and candidato.get(
+                    "entidad_sugerida"
+                )
+            ):
+                mejor[
+                    "entidad_sugerida"
+                ] = candidato.get(
+                    "entidad_sugerida"
+                )
+
+        else:
+            fusionados.append(
+                dict(
+                    candidato
+                )
+            )
+
+    return fusionados
+
+
+PALABRAS_PRIORIDAD_MIRI = {
+    "tiktok", "instagram", "youtube", "youtuber",
+    "streamer", "twitch", "kick", "influencer",
+    "influencers", "creador", "creadora", "creadores",
+    "viral", "meme", "fandom", "podcast",
+    "redes", "internet", "directo", "streaming",
+    "video", "vídeo", "polémica", "polemica",
+    "challenge", "trend", "tendencia",
+    "cantante", "artista", "música", "musica",
+    "ruptura", "pareja",
+}
+
+PALABRAS_BAJA_PRIORIDAD = {
+    "bolsa", "ibex", "euribor", "meteorologia",
+    "meteorología", "terremoto", "accidente",
+    "asesinato", "guerra", "elecciones", "elección",
+    "partido político", "congreso", "senado",
+}
+
+PALABRAS_TV = {
+    "telecinco",
+    "mediaset",
+    "antena 3",
+    "la 1",
+    "programa de televisión",
+    "programa de television",
+}
+
+PALABRAS_REALITY = {
+    "gran hermano",
+    "supervivientes",
+    "la isla de las tentaciones",
+    "reality",
+}
+
+
+def inferir_categoria_editorial(candidato):
+    categoria = (
+        candidato.get(
+            "categoria_sugerida",
+            ""
+        )
+        or ""
+    ).strip().upper()
+
+    if categoria in PESO_CATEGORIA_EDITORIAL:
+        return categoria
+
+    texto = normalizar_texto(
+        " ".join([
+            candidato.get(
+                "titulo",
+                ""
+            ),
+            candidato.get(
+                "contexto",
+                ""
+            ),
+        ])
+    )
+
+    reglas = [
+        ("TIKTOK", ["tiktok"]),
+        ("STREAMERS", ["streamer", "twitch", "kick", "streaming"]),
+        ("YOUTUBE", ["youtube", "youtuber"]),
+        ("INFLUENCERS", ["influencer"]),
+        ("CREADORES", ["creador", "creadora", "creadores"]),
+        ("MEME", ["meme"]),
+        ("MUSICA", ["musica", "música", "cancion", "canción", "artista", "cantante"]),
+        ("REALITY", ["reality", "gran hermano", "supervivientes", "tentaciones"]),
+        ("TV", ["telecinco", "mediaset", "antena 3", "television", "televisión"]),
+        ("VIRAL", ["viral", "video", "vídeo", "redes"]),
+    ]
+
+    for cat, palabras in reglas:
+        if any(
+            normalizar_texto(
+                p
+            ) in texto
+            for p in palabras
+        ):
+            return cat
+
+    return "INTERNET"
+
+
+def score_encaje_miri(candidato):
+    texto_total = normalizar_texto(
+        " ".join([
+            candidato.get(
+                "titulo",
+                ""
+            ),
+            candidato.get(
+                "contexto",
+                ""
+            ),
+        ])
+    )
+
+    titulo_norm = normalizar_texto(
+        candidato.get(
+            "titulo",
+            ""
+        )
+    )
+
+    score = int(
+        candidato.get(
+            "score_base",
+            0
+        )
+    )
+
+    for palabra in PALABRAS_PRIORIDAD_MIRI:
+        if normalizar_texto(
+            palabra
+        ) in texto_total:
+            score += 5
+
+    for palabra in PALABRAS_BAJA_PRIORIDAD:
+        if normalizar_texto(
+            palabra
+        ) in texto_total:
+            score -= 22
+
+    categoria = inferir_categoria_editorial(
+        candidato
+    )
+
+    score += PESO_CATEGORIA_EDITORIAL.get(
+        categoria,
+        0
+    )
+
+    # TV tradicional no debe ganar solo porque haya muchísimas
+    # noticias de Telecinco.
+    es_tv_titulo = any(
+        normalizar_texto(
+            p
+        ) in titulo_norm
+        for p in PALABRAS_TV
+    )
+
+    angulo_social_titulo = any(
+        normalizar_texto(
+            p
+        ) in titulo_norm
+        for p in {
+            "tiktok",
+            "instagram",
+            "youtube",
+            "viral",
+            "influencer",
+            "streamer",
+            "redes",
+            "meme",
+        }
+    )
+
+    if (
+        es_tv_titulo
+        and not angulo_social_titulo
+    ):
+        score -= 20
+
+    # Reality puede entrar, pero con menos prioridad que
+    # influencers/creadores/virales.
+    es_reality = any(
+        normalizar_texto(
+            p
+        ) in texto_total
+        for p in PALABRAS_REALITY
+    )
+
+    if (
+        es_reality
+        and categoria == "REALITY"
+    ):
+        score -= 5
+
+    # Deporte puro fuera salvo conversación de Internet.
+    deporte = {
+        "futbol", "fútbol", "liga", "champions",
+        "tenis", "formula 1", "f1", "baloncesto",
+    }
+
+    tiene_deporte = any(
+        normalizar_texto(
+            x
+        ) in texto_total
+        for x in deporte
+    )
+
+    tiene_angulo_miri = any(
+        normalizar_texto(
+            x
+        ) in texto_total
+        for x in {
+            "viral",
+            "tiktok",
+            "influencer",
+            "streamer",
+            "redes",
+            "meme",
+        }
+    )
+
+    if (
+        tiene_deporte
+        and not tiene_angulo_miri
+    ):
+        score -= 30
+
+    candidato[
+        "categoria_editorial"
+    ] = categoria
+
+    return score
+
+
+def construir_google_news_feed(query):
+    return (
+        "https://news.google.com/rss/search?q="
+        + quote_plus(
+            query
+        )
+        + "&hl=es&gl=ES&ceid=ES:es"
+    )
+
+
+def recoger_google_trends():
+    candidatos = []
+
+    try:
+        res = requests.get(
+            GOOGLE_TRENDS_RSS,
+            headers=HEADERS_BROWSER,
+            timeout=20
+        )
+
+        if res.status_code != 200:
+            print(
+                "⚠️ Google Trends RSS no respondió correctamente."
+            )
+            return candidatos
+
+        root = ET.fromstring(
+            res.content
+        )
+
+        for item in root.findall(
+            ".//item"
+        )[:30]:
+            titulo = _texto_local_tag(
+                item,
+                "title"
+            )
+
+            trafico = _texto_local_tag(
+                item,
+                "approx_traffic"
+            )
+
+            news_titles = []
+
+            for child in item.iter():
+                local = str(
+                    child.tag
+                ).split(
+                    "}"
+                )[-1]
+
+                if (
+                    local == "news_item_title"
+                    and child.text
+                ):
+                    news_titles.append(
+                        child.text.strip()
+                    )
+
+            contexto = " | ".join(
+                deduplicar_lista(
+                    news_titles
+                )[:3]
+            )
+
+            score = 30
+
+            trafico_num = re.sub(
+                r"\D",
+                "",
+                trafico
+                or ""
+            )
+
+            if trafico_num:
+                try:
+                    n = int(
+                        trafico_num
+                    )
+
+                    if n >= 100000:
+                        score += 18
+                    elif n >= 50000:
+                        score += 14
+                    elif n >= 10000:
+                        score += 9
+                    elif n >= 5000:
+                        score += 5
+
+                except Exception:
+                    pass
+
+            candidato = crear_candidato_tendencia(
+                titulo=titulo,
+                fuente="Google Trends",
+                url=GOOGLE_TRENDS_RSS,
+                contexto=contexto,
+                senal="google_trends",
+                fecha=_fecha_item_rss(
+                    item
+                ),
+                trafico=trafico,
+                score_base=score
+            )
+
+            if candidato:
+                candidatos.append(
+                    candidato
+                )
+
+    except Exception as exc:
+        print(
+            f"⚠️ Error leyendo Google Trends: {exc}"
+        )
+
+    return candidatos
+
+
+def recoger_google_news():
+    candidatos = []
+
+    for query in GOOGLE_NEWS_QUERIES:
+        url = construir_google_news_feed(
+            query
+        )
+
+        try:
+            res = requests.get(
+                url,
+                headers=HEADERS_BROWSER,
+                timeout=15
+            )
+
+            if res.status_code != 200:
+                continue
+
+            root = ET.fromstring(
+                res.content
+            )
+
+            for item in root.findall(
+                ".//item"
+            )[:8]:
+                titulo = _texto_local_tag(
+                    item,
+                    "title"
+                )
+
+                link = _texto_local_tag(
+                    item,
+                    "link"
+                )
+
+                fuente = _texto_local_tag(
+                    item,
+                    "source"
+                ) or "Google News"
+
+                candidato = crear_candidato_tendencia(
+                    titulo=titulo,
+                    fuente=fuente,
+                    url=link,
+                    contexto=(
+                        "Google News · búsqueda vertical: "
+                        f"{query}"
+                    ),
+                    senal="google_news",
+                    fecha=_fecha_item_rss(
+                        item
+                    ),
+                    score_base=16
+                )
+
+                if candidato:
+                    candidatos.append(
+                        candidato
+                    )
+
+        except Exception as exc:
+            print(
+                f"⚠️ Error Google News ({query}): {exc}"
+            )
+
+    return candidatos
+
+
+def recoger_feeds_generales():
+    candidatos = []
+
+    for feed_url in FEEDS_GENERALES:
         try:
             res = requests.get(
                 feed_url,
@@ -578,27 +1396,1103 @@ def obtener_nuevo_tema_viral():
             if res.status_code != 200:
                 continue
 
-            root = ET.fromstring(res.content)
+            root = ET.fromstring(
+                res.content
+            )
 
-            for item in root.findall(".//item"):
-                title_elem = item.find("title")
-
-                if title_elem is None or not title_elem.text:
-                    continue
-
-                title = limpiar_titulo_feed(
-                    title_elem.text
+            for item in root.findall(
+                ".//item"
+            )[:20]:
+                titulo = _texto_local_tag(
+                    item,
+                    "title"
                 )
 
-                if title and title not in historial:
-                    return title
+                link = _texto_local_tag(
+                    item,
+                    "link"
+                )
 
-        except Exception as e:
+                descripcion = limpiar_html_tags(
+                    _texto_local_tag(
+                        item,
+                        "description"
+                    )
+                )
+
+                candidato = crear_candidato_tendencia(
+                    titulo=titulo,
+                    fuente="20minutos",
+                    url=link,
+                    contexto=limitar_texto(
+                        descripcion,
+                        260
+                    ),
+                    senal="medio_general",
+                    fecha=_fecha_item_rss(
+                        item
+                    ),
+                    score_base=5
+                )
+
+                if candidato:
+                    candidatos.append(
+                        candidato
+                    )
+
+        except Exception as exc:
             print(
-                f"⚠️ Error leyendo feed {feed_url}: {e}"
+                f"⚠️ Error leyendo feed general: {exc}"
+            )
+
+    return candidatos
+
+
+def _modelos_para_google_search():
+    modelos = obtener_modelos_disponibles()
+
+    preferidos = []
+
+    for patron in [
+        "gemini-3",
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+        "gemini-2.0-flash",
+    ]:
+        for modelo in modelos:
+            m = modelo.lower()
+
+            if (
+                patron in m
+                and "image" not in m
+                and "tts" not in m
+                and "embedding" not in m
+                and modelo not in preferidos
+            ):
+                preferidos.append(
+                    modelo
+                )
+
+    return (
+        preferidos[:5]
+        or ["gemini-2.5-flash"]
+    )
+
+
+def _gemini_google_search_json(prompt, timeout=70):
+    if not GEMINI_API_KEY:
+        return None
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ],
+        "tools": [
+            {
+                "google_search": {}
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.15
+        }
+    }
+
+    for modelo in _modelos_para_google_search():
+        url = (
+            "https://generativelanguage.googleapis.com/"
+            "v1beta/models/"
+            f"{modelo}:generateContent"
+        )
+
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=timeout
+            )
+
+            if response.status_code != 200:
+                continue
+
+            data = response.json()
+
+            parts = (
+                data.get(
+                    "candidates",
+                    [{}]
+                )[0]
+                .get(
+                    "content",
+                    {}
+                )
+                .get(
+                    "parts",
+                    []
+                )
+            )
+
+            texto = "\n".join(
+                str(
+                    p.get(
+                        "text",
+                        ""
+                    )
+                )
+                for p in parts
+                if p.get(
+                    "text"
+                )
+            ).strip()
+
+            if not texto:
+                continue
+
+            return extraer_json_de_respuesta(
+                texto
+            )
+
+        except Exception as exc:
+            print(
+                f"⚠️ Google Search con {modelo}: {exc}"
             )
 
     return None
+
+
+def recoger_tendencias_sociales_gemini():
+    """
+    Este es el bloque que faltaba en el bot estable:
+    busca conversación social reciente, no solo titulares de prensa.
+    """
+    prompts = [
+        """
+Busca en la web temas que estén generando conversación REAL en España
+durante las últimas 24-48 horas sobre influencers, creadores de
+contenido, TikTokers e Instagramers.
+
+Prioriza:
+- polémicas o respuestas entre creadores
+- vídeos que se estén viralizando
+- rupturas, anuncios o cambios que estén moviendo comentarios
+- nuevos personajes de Internet de los que la gente esté hablando
+- tendencias de TikTok con suficiente contexto para un artículo
+
+NO priorices televisión tradicional salvo que el centro de la historia
+sea la conversación en redes.
+
+Devuelve SOLO JSON:
+{
+  "tendencias": [
+    {
+      "titulo": "tema concreto y actual",
+      "contexto": "qué está pasando y por qué se habla de ello",
+      "entidad": "persona o tema principal",
+      "categoria": "INFLUENCERS|TIKTOK|CREADORES|VIRAL",
+      "fuente_referencia": "fuente o URL"
+    }
+  ]
+}
+Máximo 10.
+""",
+        """
+Busca en la web temas que estén generando conversación REAL en España
+en las últimas 24-48 horas sobre YouTube, youtubers, Twitch, Kick,
+streamers, directos, podcasts y creadores digitales.
+
+Quiero historias actuales con nombres concretos y suficiente contexto
+para un artículo. Evita noticias genéricas de tecnología.
+
+Devuelve SOLO JSON:
+{
+  "tendencias": [
+    {
+      "titulo": "tema concreto",
+      "contexto": "qué ha ocurrido y por qué se está comentando",
+      "entidad": "creador/persona/canal principal",
+      "categoria": "YOUTUBE|STREAMERS|CREADORES|VIRAL",
+      "fuente_referencia": "fuente o URL"
+    }
+  ]
+}
+Máximo 10.
+""",
+        """
+Busca fenómenos virales de las últimas 24-48 horas en España:
+memes, audios, canciones, vídeos, fandoms, challenges, expresiones,
+personajes virales y temas de cultura de Internet.
+
+Elige solo fenómenos con contexto suficiente para explicar qué son,
+de dónde salen o por qué se han viralizado.
+
+Devuelve SOLO JSON:
+{
+  "tendencias": [
+    {
+      "titulo": "fenómeno concreto",
+      "contexto": "qué es y qué señal actual existe",
+      "entidad": "tema/persona/artista principal",
+      "categoria": "MEME|MUSICA|VIRAL|INTERNET",
+      "fuente_referencia": "fuente o URL"
+    }
+  ]
+}
+Máximo 10.
+""",
+        """
+Busca realities, famosos o televisión de España SOLO cuando estén
+generando una conversación digital especialmente fuerte en las últimas
+24-48 horas.
+
+No rellenes la lista con Telecinco por defecto. Si un tema de TV no
+está moviendo TikTok, X, Instagram, YouTube o conversación online,
+no lo incluyas.
+
+Devuelve SOLO JSON:
+{
+  "tendencias": [
+    {
+      "titulo": "tema concreto",
+      "contexto": "qué conversación digital está generando",
+      "entidad": "persona/programa principal",
+      "categoria": "REALITY|FAMOSOS|TV|VIRAL",
+      "fuente_referencia": "fuente o URL"
+    }
+  ]
+}
+Máximo 6.
+""",
+    ]
+
+    candidatos = []
+
+    for prompt in prompts:
+        data = _gemini_google_search_json(
+            prompt
+        )
+
+        if not isinstance(
+            data,
+            dict
+        ):
+            continue
+
+        tendencias = data.get(
+            "tendencias",
+            []
+        )
+
+        if not isinstance(
+            tendencias,
+            list
+        ):
+            continue
+
+        for item in tendencias[:10]:
+            if not isinstance(
+                item,
+                dict
+            ):
+                continue
+
+            titulo = item.get(
+                "titulo",
+                ""
+            )
+
+            contexto = item.get(
+                "contexto",
+                ""
+            )
+
+            entidad = item.get(
+                "entidad",
+                ""
+            )
+
+            categoria = item.get(
+                "categoria",
+                ""
+            )
+
+            fuente_ref = item.get(
+                "fuente_referencia",
+                ""
+            )
+
+            candidato = crear_candidato_tendencia(
+                titulo=titulo,
+                fuente=(
+                    fuente_ref
+                    or "Gemini + Google Search"
+                ),
+                url=(
+                    fuente_ref
+                    if str(
+                        fuente_ref
+                    ).startswith(
+                        "http"
+                    )
+                    else ""
+                ),
+                contexto=contexto,
+                senal="google_search_social",
+                fecha=datetime.now(
+                    timezone.utc
+                ).isoformat(
+                    timespec="seconds"
+                ),
+                score_base=28,
+                categoria=categoria,
+                entidad=entidad
+            )
+
+            if candidato:
+                candidatos.append(
+                    candidato
+                )
+
+    return candidatos
+
+
+def obtener_posts_recientes_wordpress_tendencias(
+    dias=HISTORIAL_REPETICION_DIAS,
+    limite=40
+):
+    """
+    Anti-repetición robusto: consulta WordPress REAL.
+    Así no depende de que historial_temas.json persista en GitHub.
+    """
+    if not WP_URL:
+        return []
+
+    url = (
+        f"{WP_URL}/wp-json/wp/v2/posts"
+    )
+
+    params = {
+        "per_page": min(
+            100,
+            limite
+        ),
+        "orderby": "date",
+        "order": "desc",
+        "status": "publish",
+        "_fields": "id,date_gmt,title,link",
+    }
+
+    try:
+        respuesta = requests.get(
+            url,
+            params=params,
+            auth=(
+                WP_USER,
+                WP_APP_PASS
+            ) if (
+                WP_USER
+                and WP_APP_PASS
+            ) else None,
+            timeout=25
+        )
+
+        if respuesta.status_code != 200:
+            return []
+
+        ahora = datetime.now(
+            timezone.utc
+        )
+
+        salida = []
+
+        for item in respuesta.json():
+            fecha = _parse_fecha_tendencia(
+                item.get(
+                    "date_gmt"
+                )
+            )
+
+            if fecha:
+                edad = (
+                    ahora - fecha
+                ).total_seconds() / 86400.0
+
+                if edad > dias:
+                    continue
+            else:
+                edad = None
+
+            title_obj = item.get(
+                "title",
+                {}
+            )
+
+            if isinstance(
+                title_obj,
+                dict
+            ):
+                titulo = html.unescape(
+                    title_obj.get(
+                        "rendered",
+                        ""
+                    )
+                )
+            else:
+                titulo = html.unescape(
+                    str(
+                        title_obj
+                        or ""
+                    )
+                )
+
+            salida.append({
+                "titulo": limpiar_html_tags(
+                    titulo
+                ),
+                "fecha": fecha,
+                "edad_dias": edad,
+            })
+
+        return salida
+
+    except Exception as exc:
+        print(
+            "⚠️ No pude leer posts recientes para antirepetición: "
+            f"{exc}"
+        )
+        return []
+
+
+def penalizacion_repeticion_tendencia(
+    candidato,
+    posts_recientes
+):
+    titulo = candidato.get(
+        "titulo",
+        ""
+    )
+
+    entidad = (
+        candidato.get(
+            "entidad_sugerida",
+            ""
+        )
+        or ""
+    ).strip()
+
+    penalizacion = 0
+    repeticion_dura = False
+
+    for previo in posts_recientes:
+        titulo_previo = previo.get(
+            "titulo",
+            ""
+        )
+
+        sim = similaridad_tendencia(
+            titulo,
+            titulo_previo
+        )
+
+        if sim >= UMBRAL_SIMILITUD_TEMA:
+            penalizacion += 100
+            repeticion_dura = True
+
+        elif sim >= 0.58:
+            penalizacion += 34
+
+        # Si conocemos la entidad y aparece en un post de los últimos
+        # 7 días, la castigamos para no encadenar a la misma persona.
+        if entidad:
+            edad = previo.get(
+                "edad_dias"
+            )
+
+            if (
+                edad is not None
+                and edad < COOLDOWN_ENTIDAD_DIAS
+                and normalizar_texto(
+                    entidad
+                ) in normalizar_texto(
+                    titulo_previo
+                )
+            ):
+                penalizacion += 30
+
+    # Compatibilidad con historial local antiguo.
+    for item in cargar_historial():
+        if isinstance(
+            item,
+            str
+        ):
+            sim = similaridad_tendencia(
+                titulo,
+                item
+            )
+
+            if sim >= UMBRAL_SIMILITUD_TEMA:
+                penalizacion += 80
+                repeticion_dura = True
+
+    return penalizacion, repeticion_dura
+
+
+def construir_bolsa_tendencias():
+    candidatos = []
+
+    print(
+        "📈 Google Trends España..."
+    )
+    candidatos.extend(
+        recoger_google_trends()
+    )
+
+    print(
+        "📰 Google News: influencers, TikTok, YouTube, "
+        "streamers, virales, memes y reality..."
+    )
+    candidatos.extend(
+        recoger_google_news()
+    )
+
+    print(
+        "🔎 Google Search: conversación social reciente..."
+    )
+    candidatos.extend(
+        recoger_tendencias_sociales_gemini()
+    )
+
+    print(
+        "🌐 Medio general como señal secundaria..."
+    )
+    candidatos.extend(
+        recoger_feeds_generales()
+    )
+
+    fusionados = fusionar_candidatos_tendencia(
+        candidatos
+    )
+
+    posts_recientes = (
+        obtener_posts_recientes_wordpress_tendencias()
+    )
+
+    for candidato in fusionados:
+        score = score_encaje_miri(
+            candidato
+        )
+
+        penalizacion, repeticion = (
+            penalizacion_repeticion_tendencia(
+                candidato,
+                posts_recientes
+            )
+        )
+
+        candidato[
+            "penalizacion_historial"
+        ] = penalizacion
+
+        candidato[
+            "repeticion_dura"
+        ] = repeticion
+
+        candidato[
+            "score_preliminar"
+        ] = (
+            score
+            - penalizacion
+            + (
+                max(
+                    0,
+                    len(
+                        candidato.get(
+                            "fuentes",
+                            []
+                        )
+                    )
+                    - 1
+                )
+                * 7
+            )
+            + (
+                max(
+                    0,
+                    len(
+                        candidato.get(
+                            "senales",
+                            []
+                        )
+                    )
+                    - 1
+                )
+                * 5
+            )
+        )
+
+    fusionados = [
+        c
+        for c in fusionados
+        if not c.get(
+            "repeticion_dura"
+        )
+        and c.get(
+            "score_preliminar",
+            -999
+        ) > 0
+    ]
+
+    fusionados.sort(
+        key=lambda x: x.get(
+            "score_preliminar",
+            0
+        ),
+        reverse=True
+    )
+
+    # Evitar que la preselección sea casi toda TV/Telecinco.
+    seleccion = []
+    tv_count = 0
+
+    for candidato in fusionados:
+        categoria = candidato.get(
+            "categoria_editorial",
+            ""
+        )
+
+        if categoria in {
+            "TV",
+            "REALITY",
+        }:
+            # Máximo aproximado 20% de la bolsa final.
+            limite_tv = max(
+                3,
+                int(
+                    MAX_CANDIDATOS_TENDENCIA
+                    * 0.20
+                )
+            )
+
+            if tv_count >= limite_tv:
+                continue
+
+            tv_count += 1
+
+        seleccion.append(
+            candidato
+        )
+
+        if len(
+            seleccion
+        ) >= MAX_CANDIDATOS_TENDENCIA:
+            break
+
+    return seleccion
+
+
+def seleccionar_mejor_tendencia_gemini(candidatos):
+    if not candidatos:
+        return None
+
+    candidatos_prompt = []
+
+    for i, candidato in enumerate(
+        candidatos[:55]
+    ):
+        candidatos_prompt.append({
+            "id": i,
+            "titulo": candidato.get(
+                "titulo",
+                ""
+            ),
+            "contexto": limitar_texto(
+                candidato.get(
+                    "contexto",
+                    ""
+                ),
+                350
+            ),
+            "categoria": candidato.get(
+                "categoria_editorial",
+                ""
+            ),
+            "senales": candidato.get(
+                "senales",
+                []
+            ),
+            "fuentes": candidato.get(
+                "fuentes",
+                []
+            ),
+            "score_preliminar": candidato.get(
+                "score_preliminar",
+                0
+            ),
+        })
+
+    prompt = f"""
+Eres editora de tendencias de "Miri te lo cuenta".
+
+El medio trata PRINCIPALMENTE de:
+- influencers y creadores
+- TikTok y virales
+- YouTubers
+- streamers / Twitch / Kick
+- memes, fandoms y cultura de Internet
+- polémicas y personajes que están generando conversación online
+
+Reality y televisión pueden entrar, pero NO deben dominar el medio.
+Telecinco no tiene prioridad por ser Telecinco.
+
+Selecciona y ORDENA hasta 5 historias que merezcan artículo AHORA.
+
+CANDIDATOS:
+{json.dumps(candidatos_prompt, ensure_ascii=False)}
+
+CRITERIOS:
+1. Actualidad real: está pasando o creciendo ahora.
+2. Encaje con cultura de Internet y el canal.
+3. Prioriza influencers, creadores, TikTok, YouTube, streamers,
+   virales y memes frente a TV tradicional.
+4. Da valor a temas detectados por varias fuentes/señales.
+5. No repitas prácticamente el mismo tema.
+6. Evita encadenar a la misma persona/programa.
+7. Reality/TV solo si hay conversación digital clara.
+8. No elijas política, sucesos, economía o deporte puro.
+9. No inventes que algo es viral.
+
+Devuelve SOLO JSON:
+{{
+  "ranking": [
+    {{
+      "id": 0,
+      "score": 0,
+      "entidad": "entidad principal",
+      "categoria": "INFLUENCERS|TIKTOK|STREAMERS|YOUTUBE|CREADORES|VIRAL|MEME|MUSICA|FAMOSOS|REALITY|TV|INTERNET",
+      "por_que_ahora": "motivo breve"
+    }}
+  ]
+}}
+
+Si nada sirve, devuelve {{"ranking":[]}}.
+"""
+
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "temperature": 0.2
+        }
+    }
+
+    for modelo in obtener_modelos_disponibles():
+        m = modelo.lower()
+
+        if (
+            "image" in m
+            or "tts" in m
+            or "embedding" in m
+        ):
+            continue
+
+        url = (
+            "https://generativelanguage.googleapis.com/"
+            "v1beta/models/"
+            f"{modelo}:generateContent"
+            f"?key={GEMINI_API_KEY}"
+        )
+
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=60
+            )
+
+            if response.status_code != 200:
+                continue
+
+            data = response.json()
+
+            raw = (
+                data["candidates"][0]
+                ["content"]
+                ["parts"][0]
+                ["text"]
+            )
+
+            seleccion = extraer_json_de_respuesta(
+                raw
+            )
+
+            ranking = seleccion.get(
+                "ranking",
+                []
+            )
+
+            if not isinstance(
+                ranking,
+                list
+            ):
+                ranking = []
+
+            for item in ranking[:5]:
+                if not isinstance(
+                    item,
+                    dict
+                ):
+                    continue
+
+                try:
+                    idx = int(
+                        item.get(
+                            "id",
+                            -1
+                        )
+                    )
+                except Exception:
+                    continue
+
+                if (
+                    idx < 0
+                    or idx >= len(
+                        candidatos[:55]
+                    )
+                ):
+                    continue
+
+                elegido = dict(
+                    candidatos[
+                        idx
+                    ]
+                )
+
+                entidad = (
+                    item.get(
+                        "entidad",
+                        ""
+                    )
+                    or elegido.get(
+                        "entidad_sugerida",
+                        ""
+                    )
+                    or ""
+                ).strip()
+
+                categoria = (
+                    item.get(
+                        "categoria",
+                        ""
+                    )
+                    or elegido.get(
+                        "categoria_editorial",
+                        ""
+                    )
+                    or "INTERNET"
+                ).strip().upper()
+
+                elegido[
+                    "entidad_final"
+                ] = entidad
+
+                elegido[
+                    "categoria_final"
+                ] = categoria
+
+                elegido[
+                    "score_tendencia"
+                ] = int(
+                    item.get(
+                        "score",
+                        elegido.get(
+                            "score_preliminar",
+                            0
+                        )
+                    )
+                    or 0
+                )
+
+                elegido[
+                    "por_que_ahora"
+                ] = (
+                    item.get(
+                        "por_que_ahora",
+                        ""
+                    )
+                    or ""
+                ).strip()
+
+                # Comprobación final de entidad con WordPress real.
+                repetida_entidad = False
+
+                if entidad:
+                    for previo in obtener_posts_recientes_wordpress_tendencias(
+                        dias=COOLDOWN_ENTIDAD_DIAS,
+                        limite=25
+                    ):
+                        if normalizar_texto(
+                            entidad
+                        ) in normalizar_texto(
+                            previo.get(
+                                "titulo",
+                                ""
+                            )
+                        ):
+                            repetida_entidad = True
+                            break
+
+                if repetida_entidad:
+                    print(
+                        "↪️ Se salta una candidata por repetir "
+                        f"entidad reciente: {entidad}"
+                    )
+                    continue
+
+                return elegido
+
+        except Exception as exc:
+            print(
+                f"⚠️ Selección editorial con {modelo}: {exc}"
+            )
+
+    # Fallback determinista: mejor score, con la misma bolsa ya filtrada.
+    if candidatos:
+        elegido = dict(
+            candidatos[0]
+        )
+
+        elegido[
+            "entidad_final"
+        ] = elegido.get(
+            "entidad_sugerida",
+            ""
+        )
+
+        elegido[
+            "categoria_final"
+        ] = elegido.get(
+            "categoria_editorial",
+            "INTERNET"
+        )
+
+        elegido[
+            "score_tendencia"
+        ] = elegido.get(
+            "score_preliminar",
+            0
+        )
+
+        return elegido
+
+    return None
+
+
+def obtener_nuevo_tema_viral():
+    candidatos = construir_bolsa_tendencias()
+
+    print(
+        "📊 Candidatos útiles encontrados: "
+        f"{len(candidatos)}"
+    )
+
+    # Muestra una foto rápida del mix editorial.
+    reparto = {}
+
+    for c in candidatos:
+        cat = c.get(
+            "categoria_editorial",
+            "INTERNET"
+        )
+
+        reparto[
+            cat
+        ] = reparto.get(
+            cat,
+            0
+        ) + 1
+
+    if reparto:
+        print(
+            "🧭 Reparto de candidatos: "
+            + ", ".join(
+                f"{k}={v}"
+                for k, v in sorted(
+                    reparto.items(),
+                    key=lambda x: (
+                        -x[1],
+                        x[0]
+                    )
+                )
+            )
+        )
+
+    elegido = seleccionar_mejor_tendencia_gemini(
+        candidatos
+    )
+
+    if not elegido:
+        print(
+            "⚠️ No hay un tema suficientemente bueno. "
+            "No se publicará contenido de relleno."
+        )
+        return None
+
+    print(
+        "🔥 Tendencia seleccionada: "
+        f"{elegido.get('titulo')}"
+    )
+    print(
+        "   Categoría: "
+        f"{elegido.get('categoria_final') or elegido.get('categoria_editorial')}"
+    )
+    print(
+        "   Entidad: "
+        f"{elegido.get('entidad_final') or elegido.get('entidad_sugerida') or 'n/d'}"
+    )
+    print(
+        "   Señales: "
+        f"{', '.join(elegido.get('senales', [])) or 'n/d'}"
+    )
+    print(
+        "   Fuentes: "
+        f"{', '.join(elegido.get('fuentes', [])) or 'n/d'}"
+    )
+
+    if elegido.get(
+        "por_que_ahora"
+    ):
+        print(
+            "   Por qué ahora: "
+            f"{elegido.get('por_que_ahora')}"
+        )
+
+    return elegido.get(
+        "titulo",
+        ""
+    )
 
 
 # ==========================================
@@ -3328,13 +5222,10 @@ if __name__ == "__main__":
 
     if not tema:
         print(
-            "⚠️ Sin temas nuevos. Usando tema de prueba..."
+            "⚠️ No hay una tendencia adecuada en esta ejecución. "
+            "No se publicará relleno."
         )
-
-        tema = (
-            "Polémica viral de la semana "
-            "en redes sociales"
-        )
+        raise SystemExit(0)
 
     print(
         f"🔥 Tema seleccionado: {tema}"
