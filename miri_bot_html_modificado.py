@@ -2779,13 +2779,46 @@ def obtener_nuevo_tema_viral():
             f"{elegido.get('por_que_ahora')}"
         )
 
+    # Guardamos alternativas YA encontradas para que, si la primera
+    # historia no se puede verificar, el bot pruebe otra sin repetir
+    # todo el proceso de tendencias.
+    alternativas = []
+
+    for candidato_alt in candidatos:
+        if len(
+            alternativas
+        ) >= 4:
+            break
+
+        if similaridad_tendencia(
+            candidato_alt.get(
+                "titulo",
+                ""
+            ),
+            elegido.get(
+                "titulo",
+                ""
+            )
+        ) >= 0.72:
+            continue
+
+        alternativas.append(
+            dict(
+                candidato_alt
+            )
+        )
+
+    elegido[
+        "_alternativas_verificacion"
+    ] = alternativas
+
     return elegido
 
 
 # ==========================================
 # 4B. VERIFICACIÓN FACTUAL ANTES DE REDACTAR
 # ==========================================
-def _google_search_json_rapido(prompt, timeout=24):
+def _google_search_json_rapido(prompt, timeout=18):
     """
     Un único intento de Google Search grounding.
     Si falla, el bot NO inventa: simplemente no publica esa historia.
@@ -2879,9 +2912,103 @@ def _google_search_json_rapido(prompt, timeout=24):
         if not texto:
             return None
 
-        return extraer_json_de_respuesta(
+        resultado = extraer_json_de_respuesta(
             texto
         )
+
+        if not isinstance(
+            resultado,
+            dict
+        ):
+            return None
+
+        # Google Search grounding devuelve las fuentes reales en
+        # groundingMetadata. Las conservamos para no depender de que
+        # Gemini copie bien las URLs dentro del JSON.
+        grounding = (
+            data.get(
+                "candidates",
+                [{}]
+            )[0]
+            .get(
+                "groundingMetadata",
+                {}
+            )
+        )
+
+        grounding_sources = []
+
+        for chunk in grounding.get(
+            "groundingChunks",
+            []
+        ) or []:
+            if not isinstance(
+                chunk,
+                dict
+            ):
+                continue
+
+            web = chunk.get(
+                "web",
+                {}
+            )
+
+            if not isinstance(
+                web,
+                dict
+            ):
+                continue
+
+            uri = str(
+                web.get(
+                    "uri",
+                    ""
+                )
+                or ""
+            ).strip()
+
+            title = str(
+                web.get(
+                    "title",
+                    ""
+                )
+                or ""
+            ).strip()
+
+            if uri.startswith(
+                ("http://", "https://")
+            ):
+                grounding_sources.append({
+                    "nombre": title or "Fuente",
+                    "url": uri,
+                })
+
+        # Deduplicar por URL.
+        vistos = set()
+        unicos = []
+
+        for fuente in grounding_sources:
+            url_fuente = fuente.get(
+                "url",
+                ""
+            )
+
+            if (
+                url_fuente
+                and url_fuente not in vistos
+            ):
+                vistos.add(
+                    url_fuente
+                )
+                unicos.append(
+                    fuente
+                )
+
+        resultado[
+            "_grounding_sources"
+        ] = unicos[:8]
+
+        return resultado
 
     except Exception as exc:
         print(
@@ -2978,8 +3105,9 @@ REGLAS MUY ESTRICTAS:
 7. Si dos fuentes hablan de hechos diferentes, NO las unas.
 8. Para cada hecho confirmado devuelve una URL pública concreta
    que respalde ESE hecho.
-9. Si no puedes verificar al menos dos hechos concretos sobre
-   la misma historia, marca "publicable": false.
+9. Para marcar "publicable": true basta con UN hecho concreto,
+   reciente y claramente respaldado por una fuente pública.
+   Si puedes confirmar más hechos, inclúyelos.
 10. Si el hecho principal existe pero el título mezcla personas
     o datos que no corresponden, corrige "tema_verificado" y deja
     fuera lo que no esté respaldado.
@@ -3100,13 +3228,72 @@ Si no está suficientemente respaldado:
                 "fuente_url": fuente_url,
             })
 
-    # Dos hechos mínimos de la MISMA historia.
+    # Recuperar también las fuentes reales que devolvió
+    # Google Search grounding.
+    grounding_sources = data.get(
+        "_grounding_sources",
+        []
+    )
+
+    if not isinstance(
+        grounding_sources,
+        list
+    ):
+        grounding_sources = []
+
+    # Si Gemini confirmó un hecho pero olvidó copiar la URL dentro
+    # del JSON, y Google Search solo devolvió UNA fuente concreta,
+    # podemos asociarla de forma segura.
+    if (
+        not hechos_validos
+        and len(
+            grounding_sources
+        ) == 1
+    ):
+        hechos_sin_url = [
+            item
+            for item in hechos
+            if isinstance(
+                item,
+                dict
+            )
+            and str(
+                item.get(
+                    "hecho",
+                    ""
+                )
+                or ""
+            ).strip()
+        ]
+
+        if len(
+            hechos_sin_url
+        ) == 1:
+            hechos_validos.append({
+                "hecho": str(
+                    hechos_sin_url[0].get(
+                        "hecho",
+                        ""
+                    )
+                ).strip(),
+                "fuente_nombre": grounding_sources[0].get(
+                    "nombre",
+                    "Fuente"
+                ),
+                "fuente_url": grounding_sources[0].get(
+                    "url",
+                    ""
+                ),
+            })
+
+    # Un hecho sólido y con fuente concreta es suficiente.
+    # Si hay poca información, el artículo será más corto.
     if len(
         hechos_validos
-    ) < 2:
+    ) < 1:
         print(
-            "⛔ No hay suficientes hechos con fuente concreta. "
-            "No se publica."
+            "⛔ No hay ningún hecho concreto con fuente verificable. "
+            "Se probará otra tendencia."
         )
         return None
 
@@ -3151,6 +3338,44 @@ Si no está suficientemente respaldado:
         ):
             fuentes_validas.append({
                 "nombre": nombre,
+                "url": url,
+            })
+
+    # Añadir también las fuentes reales del grounding de Google.
+    for fuente in grounding_sources:
+        if not isinstance(
+            fuente,
+            dict
+        ):
+            continue
+
+        url = str(
+            fuente.get(
+                "url",
+                ""
+            )
+            or ""
+        ).strip()
+
+        if (
+            url.startswith(
+                ("http://", "https://")
+            )
+            and not any(
+                f.get(
+                    "url"
+                ) == url
+                for f in fuentes_validas
+            )
+        ):
+            fuentes_validas.append({
+                "nombre": str(
+                    fuente.get(
+                        "nombre",
+                        ""
+                    )
+                    or "Fuente"
+                ).strip(),
                 "url": url,
             })
 
@@ -3389,7 +3614,7 @@ IMPORTANTE:
 - NO dejes ninguna frase a medias ni ningún párrafo cortado.
 - Todos los párrafos deben terminar con una frase completa.
 - El titular también debe estar ortográfica y gramaticalmente correcto.
-- El artículo debe tener entre 4 y 7 párrafos cortos.
+- El artículo debe tener entre 2 y 5 párrafos cortos. Si hay pocos hechos confirmados, usa 2 o 3; NO rellenes.
 - Responde ÚNICAMENTE con un objeto JSON válido.
 - No uses Markdown.
 
@@ -6303,16 +6528,48 @@ if __name__ == "__main__":
         "🧾 Verificando hechos y relaciones entre personas..."
     )
 
-    evidencia = investigar_tendencia_sin_inventar(
+    candidatos_a_verificar = [
         candidato
+    ] + candidato.get(
+        "_alternativas_verificacion",
+        []
     )
+
+    evidencia = None
+    candidato_verificado = None
+
+    # Máximo 4 intentos para que tampoco vuelva a quedarse pensando.
+    for numero, candidato_prueba in enumerate(
+        candidatos_a_verificar[:4],
+        start=1
+    ):
+        print(
+            f"🔍 Verificación {numero}/4: "
+            f"{candidato_prueba.get('titulo', '')}"
+        )
+
+        evidencia_prueba = investigar_tendencia_sin_inventar(
+            candidato_prueba
+        )
+
+        if evidencia_prueba:
+            evidencia = evidencia_prueba
+            candidato_verificado = candidato_prueba
+            break
+
+        print(
+            "↪️ Esa historia no quedó suficientemente respaldada. "
+            "Se prueba la siguiente."
+        )
 
     if not evidencia:
         print(
-            "⛔ La historia no está suficientemente verificada. "
-            "No se publicará."
+            "⛔ Ninguna de las tendencias candidatas pudo verificarse "
+            "con una fuente concreta. No se publicará para no inventar."
         )
         raise SystemExit(0)
+
+    candidato = candidato_verificado
 
     tema = evidencia.get(
         "tema_verificado",
