@@ -99,6 +99,14 @@ EJECUCION_MANUAL_GITHUB = (
 GOOGLE_TRENDS_RSS = "https://trends.google.com/trending/rss?geo=ES"
 
 GOOGLE_NEWS_QUERIES = [
+    # Audiencia puente: el público que llegó por Casa/Zona Gemelos.
+    "\"Casa de los Gemelos\" OR ZonaGemelos when:3d",
+    "\"Casa de los Gemelos 3\" when:3d",
+    "\"Zona Gemelos\" participantes influencer polémica when:3d",
+    "\"Serena Milan\" OR \"Serena Milán\" when:7d",
+    "\"Imantado\" influencer streamer when:7d",
+    "\"Johaan\" influencer TikTok when:7d",
+
     "TikTok España influencer viral polémica when:2d",
     "influencer España creador contenido polémica viral when:2d",
     "youtuber YouTube España polémica viral when:2d",
@@ -148,7 +156,12 @@ UMBRAL_SIMILITUD_TEMA = float(
 
 # Preferencia editorial. NO son cuotas rígidas.
 # Sirven para que Telecinco/TV no gane por pura abundancia de noticias.
+# "AUDIENCIA_PUENTE" ayuda a no romper de golpe con el público
+# que llegó por Casa de los Gemelos / Zona Gemelos y personajes
+# de ese ecosistema. Tiene prioridad alta, pero no puede copar
+# todas las publicaciones seguidas.
 PESO_CATEGORIA_EDITORIAL = {
+    "AUDIENCIA_PUENTE": 32,
     "INFLUENCERS": 24,
     "TIKTOK": 22,
     "STREAMERS": 21,
@@ -161,6 +174,20 @@ PESO_CATEGORIA_EDITORIAL = {
     "FAMOSOS": 10,
     "REALITY": 3,
     "TV": -8,
+}
+
+# Nombres/temas que conectan directamente con la audiencia actual.
+# Se buscan como señal editorial; NO obligan a publicar si no hay
+# una historia real y reciente.
+AUDIENCIA_PUENTE_TERMINOS = {
+    "casa de los gemelos",
+    "casa de los gemelos 3",
+    "zona gemelos",
+    "zonagemelos",
+    "serena milan",
+    "serena milán",
+    "imantado",
+    "johaan",
 }
 
 HEADERS_BROWSER = {
@@ -1101,6 +1128,19 @@ def fusionar_candidatos_tendencia(candidatos):
     return fusionados
 
 
+def es_tema_audiencia_puente(texto):
+    texto_norm = normalizar_texto(
+        str(texto or "")
+    )
+
+    return any(
+        normalizar_texto(
+            termino
+        ) in texto_norm
+        for termino in AUDIENCIA_PUENTE_TERMINOS
+    )
+
+
 PALABRAS_PRIORIDAD_MIRI = {
     "tiktok", "instagram", "youtube", "youtuber",
     "streamer", "twitch", "kick", "influencer",
@@ -1162,6 +1202,11 @@ def inferir_categoria_editorial(candidato):
         ])
     )
 
+    if es_tema_audiencia_puente(
+        texto
+    ):
+        return "AUDIENCIA_PUENTE"
+
     reglas = [
         ("TIKTOK", ["tiktok"]),
         ("STREAMERS", ["streamer", "twitch", "kick", "streaming"]),
@@ -1214,6 +1259,20 @@ def score_encaje_miri(candidato):
             0
         )
     )
+
+    # Puente de transición: si hay una noticia real del universo
+    # que ya conoce la audiencia, gana prioridad.
+    if es_tema_audiencia_puente(
+        texto_total
+    ):
+        score += 24
+        candidato[
+            "es_audiencia_puente"
+        ] = True
+    else:
+        candidato[
+            "es_audiencia_puente"
+        ] = False
 
     for palabra in PALABRAS_PRIORIDAD_MIRI:
         if normalizar_texto(
@@ -1705,6 +1764,52 @@ def recoger_tendencias_sociales_gemini():
     """
     prompts = [
         """
+AUDIENCIA PUENTE DE "MIRI TE LO CUENTA".
+
+Busca en la web noticias, salseos y conversaciones REALES y RECIENTES
+(últimas 72 horas; hasta 7 días solo si sigue habiendo novedad)
+relacionadas con:
+
+- La Casa de los Gemelos
+- La Casa de los Gemelos 3
+- Zona Gemelos / ZonaGemelos
+- participantes, exparticipantes y personas de su entorno
+- Serena Milan / Serena Milán
+- Imantado
+- Johaan
+- otros personajes de Internet claramente conectados con ese mismo
+  ecosistema y audiencia
+
+Prioriza:
+- discusiones, respuestas, rupturas, reconciliaciones, indirectas
+- nuevos vídeos o directos que estén generando conversación
+- polémicas entre participantes o creadores
+- novedades de los formatos de Zona Gemelos
+- noticias personales o profesionales de esos personajes
+  cuando estén siendo comentadas en redes
+
+MUY IMPORTANTE:
+- NO inventes una noticia porque uno de esos nombres aparezca en la lista.
+- Si no hay novedad real y reciente de una persona, no la incluyas.
+- No uses contenido antiguo como si acabara de ocurrir.
+- Una noticia de este bloque puede competir con tendencias generales,
+  pero no debe ganar solo por pertenecer a Casa/Zona Gemelos.
+
+Devuelve SOLO JSON:
+{
+  "tendencias": [
+    {
+      "titulo": "hecho concreto y actual",
+      "contexto": "qué ha pasado y por qué interesa a esa audiencia",
+      "entidad": "persona/programa principal",
+      "categoria": "AUDIENCIA_PUENTE",
+      "fuente_referencia": "fuente o URL"
+    }
+  ]
+}
+Máximo 10.
+""",
+        """
 Busca en la web temas que estén generando conversación REAL en España
 durante las últimas 24-48 horas sobre influencers, creadores de
 contenido, TikTokers e Instagramers.
@@ -2020,6 +2125,50 @@ def penalizacion_repeticion_tendencia(
     penalizacion = 0
     repeticion_dura = False
 
+    # La audiencia puente debe aparecer con cierta frecuencia,
+    # pero no convertir el canal otra vez en un monográfico.
+    if es_tema_audiencia_puente(
+        titulo
+        + " "
+        + candidato.get(
+            "contexto",
+            ""
+        )
+    ):
+        ultimos_3 = posts_recientes[:3]
+        ultimos_6 = posts_recientes[:6]
+
+        puente_3 = sum(
+            1
+            for previo in ultimos_3
+            if es_tema_audiencia_puente(
+                previo.get(
+                    "titulo",
+                    ""
+                )
+            )
+        )
+
+        puente_6 = sum(
+            1
+            for previo in ultimos_6
+            if es_tema_audiencia_puente(
+                previo.get(
+                    "titulo",
+                    ""
+                )
+            )
+        )
+
+        if puente_3 >= 1:
+            penalizacion += 14
+
+        if puente_3 >= 2:
+            penalizacion += 28
+
+        if puente_6 >= 3:
+            penalizacion += 22
+
     for previo in posts_recientes:
         titulo_previo = previo.get(
             "titulo",
@@ -2289,14 +2438,19 @@ CANDIDATOS:
 CRITERIOS:
 1. Actualidad real: está pasando o creciendo ahora.
 2. Encaje con cultura de Internet y el canal.
-3. Prioriza influencers, creadores, TikTok, YouTube, streamers,
+3. Durante esta etapa de transición, da una VENTAJA MODERADA a noticias
+   reales y recientes de Casa de los Gemelos, Zona Gemelos, sus
+   participantes y personajes conocidos por esa audiencia.
+4. Esa ventaja es un puente, NO una obligación: si no hay novedad real,
+   elige otra tendencia mejor.
+5. Prioriza influencers, creadores, TikTok, YouTube, streamers,
    virales y memes frente a TV tradicional.
-4. Da valor a temas detectados por varias fuentes/señales.
-5. No repitas prácticamente el mismo tema.
-6. Evita encadenar a la misma persona/programa.
-7. Reality/TV solo si hay conversación digital clara.
-8. No elijas política, sucesos, economía o deporte puro.
-9. No inventes que algo es viral.
+6. Da valor a temas detectados por varias fuentes/señales.
+7. No repitas prácticamente el mismo tema.
+8. Evita encadenar a la misma persona/programa.
+9. Reality/TV solo si hay conversación digital clara.
+10. No elijas política, sucesos, economía o deporte puro.
+11. No inventes que algo es viral.
 
 Devuelve SOLO JSON:
 {{
@@ -2305,7 +2459,7 @@ Devuelve SOLO JSON:
       "id": 0,
       "score": 0,
       "entidad": "entidad principal",
-      "categoria": "INFLUENCERS|TIKTOK|STREAMERS|YOUTUBE|CREADORES|VIRAL|MEME|MUSICA|FAMOSOS|REALITY|TV|INTERNET",
+      "categoria": "AUDIENCIA_PUENTE|INFLUENCERS|TIKTOK|STREAMERS|YOUTUBE|CREADORES|VIRAL|MEME|MUSICA|FAMOSOS|REALITY|TV|INTERNET",
       "por_que_ahora": "motivo breve"
     }}
   ]
