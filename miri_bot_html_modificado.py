@@ -103,9 +103,9 @@ GOOGLE_NEWS_QUERIES = [
     "\"Casa de los Gemelos\" OR ZonaGemelos when:3d",
     "\"Casa de los Gemelos 3\" when:3d",
     "\"Zona Gemelos\" participantes influencer polémica when:3d",
-    "\"Serena Milan\" OR \"Serena Milán\" when:7d",
+    "\"Selena Millán\" OR \"Selena Millan\" when:7d",
     "\"Imantado\" influencer streamer when:7d",
-    "\"Johaan\" influencer TikTok when:7d",
+    "\"IlloJuan\" streamer YouTube Twitch when:7d",
 
     "TikTok España influencer viral polémica when:2d",
     "influencer España creador contenido polémica viral when:2d",
@@ -184,10 +184,10 @@ AUDIENCIA_PUENTE_TERMINOS = {
     "casa de los gemelos 3",
     "zona gemelos",
     "zonagemelos",
-    "serena milan",
-    "serena milán",
+    "selena millán",
+    "selena millan",
     "imantado",
-    "johaan",
+    "illojuan",
 }
 
 HEADERS_BROWSER = {
@@ -1774,9 +1774,9 @@ relacionadas con:
 - La Casa de los Gemelos 3
 - Zona Gemelos / ZonaGemelos
 - participantes, exparticipantes y personas de su entorno
-- Serena Milan / Serena Milán
+- Selena Millán
 - Imantado
-- Johaan
+- IlloJuan
 - otros personajes de Internet claramente conectados con ese mismo
   ecosistema y audiencia
 
@@ -1794,6 +1794,15 @@ MUY IMPORTANTE:
 - No uses contenido antiguo como si acabara de ocurrir.
 - Una noticia de este bloque puede competir con tendencias generales,
   pero no debe ganar solo por pertenecer a Casa/Zona Gemelos.
+- PRIORIZA como fuente:
+  1) publicaciones, vídeos, directos o perfiles públicos del propio creador;
+  2) canales/web oficial de Zona Gemelos o del formato;
+  3) medios periodísticos o entrevistas;
+  4) otras páginas solo como pista secundaria.
+- Foros, comentarios o rumores NO bastan por sí solos para convertir
+  una historia en noticia.
+- En "fuente_referencia" devuelve una fuente pública concreta
+  relacionada con el hecho reciente.
 
 Devuelve SOLO JSON:
 {
@@ -2770,9 +2779,522 @@ def obtener_nuevo_tema_viral():
             f"{elegido.get('por_que_ahora')}"
         )
 
-    return elegido.get(
+    return elegido
+
+
+# ==========================================
+# 4B. VERIFICACIÓN FACTUAL ANTES DE REDACTAR
+# ==========================================
+def _google_search_json_rapido(prompt, timeout=24):
+    """
+    Un único intento de Google Search grounding.
+    Si falla, el bot NO inventa: simplemente no publica esa historia.
+    """
+    if not GEMINI_API_KEY:
+        return None
+
+    modelos = _modelos_para_google_search()
+
+    modelo = (
+        modelos[0]
+        if modelos
+        else "gemini-2.5-flash"
+    )
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ],
+        "tools": [
+            {
+                "google_search": {}
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.0
+        }
+    }
+
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        "v1beta/models/"
+        f"{modelo}:generateContent"
+    )
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=timeout
+        )
+
+        if response.status_code != 200:
+            print(
+                "⚠️ La verificación factual no respondió correctamente."
+            )
+            return None
+
+        data = response.json()
+
+        parts = (
+            data.get(
+                "candidates",
+                [{}]
+            )[0]
+            .get(
+                "content",
+                {}
+            )
+            .get(
+                "parts",
+                []
+            )
+        )
+
+        texto = "\n".join(
+            str(
+                p.get(
+                    "text",
+                    ""
+                )
+            )
+            for p in parts
+            if p.get(
+                "text"
+            )
+        ).strip()
+
+        if not texto:
+            return None
+
+        return extraer_json_de_respuesta(
+            texto
+        )
+
+    except Exception as exc:
+        print(
+            f"⚠️ Verificación factual omitida por error: {exc}"
+        )
+        return None
+
+
+def investigar_tendencia_sin_inventar(candidato):
+    """
+    Antes de redactar, obliga a comprobar que:
+    - el hecho existe;
+    - las personas realmente están relacionadas con ESE hecho;
+    - cada hecho usado tenga una URL pública concreta.
+
+    Ejemplo de error que evita:
+    unir una polémica real de Aída Nízar con declaraciones de un abogado
+    que en realidad pertenecían a otro caso distinto.
+    """
+    if not isinstance(
+        candidato,
+        dict
+    ):
+        return None
+
+    titulo = candidato.get(
         "titulo",
         ""
+    )
+
+    contexto = candidato.get(
+        "contexto",
+        ""
+    )
+
+    entidad = (
+        candidato.get(
+            "entidad_final",
+            ""
+        )
+        or candidato.get(
+            "entidad_sugerida",
+            ""
+        )
+        or ""
+    )
+
+    url_origen = candidato.get(
+        "url",
+        ""
+    )
+
+    fuentes_detectadas = candidato.get(
+        "fuentes",
+        []
+    )
+
+    prompt = f"""
+Actúa como verificadora factual de un medio de cultura de Internet.
+
+Hay un posible tema para publicar:
+
+TÍTULO DETECTADO:
+{titulo}
+
+CONTEXTO DETECTADO:
+{contexto}
+
+ENTIDAD PRINCIPAL DETECTADA:
+{entidad}
+
+URL DE ORIGEN:
+{url_origen}
+
+FUENTES/SEÑALES DETECTADAS:
+{json.dumps(fuentes_detectadas, ensure_ascii=False)}
+
+Busca en Google información pública y reciente sobre EXACTAMENTE
+este hecho.
+
+REGLAS MUY ESTRICTAS:
+
+1. NO mezcles noticias distintas porque compartan una persona,
+   profesión, programa o temática.
+2. Una persona SOLO puede aparecer en "hechos_confirmados" si una
+   fuente concreta la relaciona directamente con ESTE hecho.
+3. No deduzcas que alguien declaró, reaccionó, denunció, analizó,
+   respondió o participó si la fuente no lo dice.
+4. No conviertas rumores, comentarios de foros o especulaciones
+   en hechos.
+5. No inventes citas.
+6. No inventes fechas, cargos, parentescos, relaciones,
+   consecuencias legales, estados emocionales ni contexto.
+7. Si dos fuentes hablan de hechos diferentes, NO las unas.
+8. Para cada hecho confirmado devuelve una URL pública concreta
+   que respalde ESE hecho.
+9. Si no puedes verificar al menos dos hechos concretos sobre
+   la misma historia, marca "publicable": false.
+10. Si el hecho principal existe pero el título mezcla personas
+    o datos que no corresponden, corrige "tema_verificado" y deja
+    fuera lo que no esté respaldado.
+11. Es mejor NO publicar que completar huecos.
+
+Devuelve SOLO JSON válido:
+
+{{
+  "publicable": true,
+  "tema_verificado": "formulación factual y exacta del tema",
+  "resumen_verificado": "resumen breve usando solo hechos comprobados",
+  "personas_confirmadas": [
+    "nombre exacto"
+  ],
+  "hechos_confirmados": [
+    {{
+      "hecho": "hecho concreto",
+      "fuente_nombre": "nombre de la fuente",
+      "fuente_url": "https://..."
+    }}
+  ],
+  "fuentes": [
+    {{
+      "nombre": "fuente",
+      "url": "https://..."
+    }}
+  ],
+  "motivo_no_publicable": ""
+}}
+
+Si no está suficientemente respaldado:
+{{
+  "publicable": false,
+  "tema_verificado": "",
+  "resumen_verificado": "",
+  "personas_confirmadas": [],
+  "hechos_confirmados": [],
+  "fuentes": [],
+  "motivo_no_publicable": "explicación breve"
+}}
+"""
+
+    data = _google_search_json_rapido(
+        prompt
+    )
+
+    if not isinstance(
+        data,
+        dict
+    ):
+        print(
+            "⛔ Sin verificación suficiente: no se publicará."
+        )
+        return None
+
+    if data.get(
+        "publicable"
+    ) is not True:
+        print(
+            "⛔ Tema descartado por falta de pruebas: "
+            f"{data.get('motivo_no_publicable', 'sin detalle')}"
+        )
+        return None
+
+    hechos = data.get(
+        "hechos_confirmados",
+        []
+    )
+
+    if not isinstance(
+        hechos,
+        list
+    ):
+        hechos = []
+
+    hechos_validos = []
+
+    for item in hechos:
+        if not isinstance(
+            item,
+            dict
+        ):
+            continue
+
+        hecho = str(
+            item.get(
+                "hecho",
+                ""
+            )
+            or ""
+        ).strip()
+
+        fuente_url = str(
+            item.get(
+                "fuente_url",
+                ""
+            )
+            or ""
+        ).strip()
+
+        fuente_nombre = str(
+            item.get(
+                "fuente_nombre",
+                ""
+            )
+            or ""
+        ).strip()
+
+        if (
+            hecho
+            and fuente_url.startswith(
+                ("http://", "https://")
+            )
+        ):
+            hechos_validos.append({
+                "hecho": hecho,
+                "fuente_nombre": fuente_nombre,
+                "fuente_url": fuente_url,
+            })
+
+    # Dos hechos mínimos de la MISMA historia.
+    if len(
+        hechos_validos
+    ) < 2:
+        print(
+            "⛔ No hay suficientes hechos con fuente concreta. "
+            "No se publica."
+        )
+        return None
+
+    fuentes = data.get(
+        "fuentes",
+        []
+    )
+
+    if not isinstance(
+        fuentes,
+        list
+    ):
+        fuentes = []
+
+    fuentes_validas = []
+
+    for fuente in fuentes:
+        if not isinstance(
+            fuente,
+            dict
+        ):
+            continue
+
+        url = str(
+            fuente.get(
+                "url",
+                ""
+            )
+            or ""
+        ).strip()
+
+        nombre = str(
+            fuente.get(
+                "nombre",
+                ""
+            )
+            or ""
+        ).strip()
+
+        if url.startswith(
+            ("http://", "https://")
+        ):
+            fuentes_validas.append({
+                "nombre": nombre,
+                "url": url,
+            })
+
+    # Añadir las URLs de cada hecho por si Gemini no las repite
+    # en el bloque "fuentes".
+    for hecho in hechos_validos:
+        url = hecho[
+            "fuente_url"
+        ]
+
+        if not any(
+            f.get(
+                "url"
+            ) == url
+            for f in fuentes_validas
+        ):
+            fuentes_validas.append({
+                "nombre": hecho.get(
+                    "fuente_nombre",
+                    ""
+                ),
+                "url": url,
+            })
+
+    tema_verificado = str(
+        data.get(
+            "tema_verificado",
+            ""
+        )
+        or titulo
+    ).strip()
+
+    resumen_verificado = str(
+        data.get(
+            "resumen_verificado",
+            ""
+        )
+        or ""
+    ).strip()
+
+    personas = data.get(
+        "personas_confirmadas",
+        []
+    )
+
+    if not isinstance(
+        personas,
+        list
+    ):
+        personas = []
+
+    resultado = {
+        "tema_verificado": tema_verificado,
+        "resumen_verificado": resumen_verificado,
+        "personas_confirmadas": [
+            str(
+                p
+            ).strip()
+            for p in personas
+            if str(
+                p
+            ).strip()
+        ],
+        "hechos_confirmados": hechos_validos,
+        "fuentes": fuentes_validas[:6],
+    }
+
+    print(
+        "✅ Tema verificado antes de redactar."
+    )
+    print(
+        f"   Hechos con fuente: {len(hechos_validos)}"
+    )
+    print(
+        f"   Fuentes concretas: {len(fuentes_validas)}"
+    )
+
+    return resultado
+
+
+def construir_fuentes_articulo_html(evidencia):
+    """
+    Deja trazabilidad visible en el artículo.
+    """
+    if not isinstance(
+        evidencia,
+        dict
+    ):
+        return ""
+
+    fuentes = evidencia.get(
+        "fuentes",
+        []
+    )
+
+    enlaces = []
+
+    for fuente in fuentes[:4]:
+        if not isinstance(
+            fuente,
+            dict
+        ):
+            continue
+
+        nombre = html.escape(
+            str(
+                fuente.get(
+                    "nombre",
+                    ""
+                )
+                or "Fuente"
+            )
+        )
+
+        url = str(
+            fuente.get(
+                "url",
+                ""
+            )
+            or ""
+        ).strip()
+
+        if not url.startswith(
+            ("http://", "https://")
+        ):
+            continue
+
+        enlaces.append(
+            f'<a href="{html.escape(url)}" '
+            'target="_blank" rel="noopener noreferrer">'
+            f'{nombre}</a>'
+        )
+
+    if not enlaces:
+        return ""
+
+    return (
+        '<p style="font-size:12px;color:#68635F;'
+        'margin-top:28px;line-height:1.5;">'
+        '<strong>Fuentes consultadas:</strong> '
+        + " · ".join(
+            enlaces
+        )
+        + "</p>"
     )
 
 
@@ -2826,7 +3348,7 @@ def obtener_modelos_disponibles():
     ]
 
 
-def generar_articulo_miri(tema_viral):
+def generar_articulo_miri(tema_viral, evidencia_verificada):
     modelos = obtener_modelos_disponibles()
 
     prompt = f"""
@@ -2838,9 +3360,28 @@ de salseo sobre esta tendencia:
 
 "{tema_viral}"
 
+EVIDENCIA VERIFICADA:
+{json.dumps(evidencia_verificada, ensure_ascii=False, indent=2)}
+
+REGLA CENTRAL:
+TODO dato factual del artículo debe poder salir de
+"hechos_confirmados" o "resumen_verificado".
+
 IMPORTANTE:
-- No inventes hechos concretos que no estén justificados.
-- No inventes declaraciones textuales.
+- NO introduzcas hechos que no aparezcan en la evidencia verificada.
+- NO añadas personas que no estén en "personas_confirmadas" o
+  mencionadas expresamente en "hechos_confirmados".
+- NO unas hechos de noticias diferentes.
+- NO atribuyas declaraciones, reacciones, análisis o acciones a una
+  persona si la evidencia no la relaciona directamente con ese hecho.
+- NO inventes declaraciones textuales.
+- NO inventes interpretaciones jurídicas, psicológicas, sentimentales,
+  económicas o personales.
+- NO rellenes huecos con "seguramente", "todo apunta", "parece que",
+  "habría provocado" ni fórmulas equivalentes.
+- Si hay poca información, escribe MENOS contenido; no rellenes.
+- Una opinión ligera de estilo puede aparecer, pero debe quedar
+  claramente como comentario editorial y no como un hecho.
 - El contenido debe sonar natural y periodístico.
 - Escribe en español correcto y natural de España.
 - Revisa ORTOGRAFÍA, tildes, puntuación y concordancia antes de responder.
@@ -2943,7 +3484,7 @@ REGLAS EDITORIALES PARA ELEGIR LA IMAGEN:
         ],
         "generationConfig": {
             "response_mime_type": "application/json",
-            "temperature": 0.7
+            "temperature": 0.2
         }
     }
 
@@ -3111,7 +3652,8 @@ def _modelo_editorial_rapido():
 def revisar_articulo_y_crear_titulo_social(
     titulo,
     contenido_html,
-    tema_viral
+    tema_viral,
+    evidencia_verificada=None
 ):
     """
     Revisión editorial RÁPIDA:
@@ -3140,11 +3682,19 @@ TÍTULO:
 CUERPO HTML:
 {contenido_html}
 
+EVIDENCIA VERIFICADA:
+{json.dumps(evidencia_verificada or {}, ensure_ascii=False, indent=2)}
+
 Haz únicamente esto:
 - corrige ortografía, tildes, puntuación y concordancia;
 - corrige palabras mal escritas;
-- completa frases que hayan quedado gramaticalmente rotas;
-- no inventes información ni elimines datos;
+- si una frase está rota, arréglala SOLO si puede hacerse sin añadir
+  un hecho nuevo; si no, elimínala;
+- elimina cualquier afirmación factual que NO esté respaldada por la
+  evidencia verificada;
+- no añadas personas, relaciones, declaraciones, causas,
+  consecuencias ni interpretaciones nuevas;
+- no inventes información;
 - conserva los mismos párrafos <p>...</p>;
 - corrige también el título;
 - crea un titulo_social de 55 a 100 caracteres;
@@ -5740,9 +6290,9 @@ if __name__ == "__main__":
     elif not puede_publicar_por_frecuencia():
         raise SystemExit(0)
 
-    tema = obtener_nuevo_tema_viral()
+    candidato = obtener_nuevo_tema_viral()
 
-    if not tema:
+    if not candidato:
         print(
             "⚠️ No hay una tendencia adecuada en esta ejecución. "
             "No se publicará relleno."
@@ -5750,11 +6300,35 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     print(
-        f"🔥 Tema seleccionado: {tema}"
+        "🧾 Verificando hechos y relaciones entre personas..."
+    )
+
+    evidencia = investigar_tendencia_sin_inventar(
+        candidato
+    )
+
+    if not evidencia:
+        print(
+            "⛔ La historia no está suficientemente verificada. "
+            "No se publicará."
+        )
+        raise SystemExit(0)
+
+    tema = evidencia.get(
+        "tema_verificado",
+        candidato.get(
+            "titulo",
+            ""
+        )
+    )
+
+    print(
+        f"🔥 Tema verificado: {tema}"
     )
 
     articulo = generar_articulo_miri(
-        tema
+        tema,
+        evidencia
     )
 
     titulo = articulo[
@@ -5768,7 +6342,8 @@ if __name__ == "__main__":
     revision = revisar_articulo_y_crear_titulo_social(
         titulo=titulo,
         contenido_html=contenido_html,
-        tema_viral=tema
+        tema_viral=tema,
+        evidencia_verificada=evidencia
     )
 
     titulo = revision.get(
@@ -5874,6 +6449,13 @@ if __name__ == "__main__":
     print(
         f"🔎 Búsquedas imagen: {busquedas_imagen}"
     )
+
+    fuentes_html = construir_fuentes_articulo_html(
+        evidencia
+    )
+
+    if fuentes_html:
+        contenido_html += fuentes_html
 
     ruta_imagen, info_imagen = generar_miniatura(
         titulo_miniatura=titulo_miniatura,
